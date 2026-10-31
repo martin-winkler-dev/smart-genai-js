@@ -1,0 +1,77 @@
+{
+  "name": "smart-genai",
+  "version": "0.1.0",
+  "description": "One client for Gemini Developer API and Vertex AI with single requests and batch jobs.",
+  "keywords": [],
+  "author": "Martin Winkler",
+  "license": "Apache-2.0",
+  "private": false,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/martin-winkler-dev/smart-genai-js.git"
+  },
+  "bugs": {
+    "url": "https://github.com/martin-winkler-dev/smart-genai-js/issues"
+  },
+  "homepage": "https://github.com/martin-winkler-dev/smart-genai-js#readme",
+  "packageManager": "bun@1.4.2",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "src"
+  ],
+  "exports": {
+    ".": {
+      "bun": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "sideEffects": false,
+  "engines": {
+    "node": ">=22.12.0",
+    "bun": ">=1.3.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "clean": "rm -rf dist",
+    "build": "bun run clean && bun run build:types && bun run build:js",
+    "build:types": "tsc --emitDeclarationOnly",
+    "build:js": "bun build ./src/index.ts --outdir ./dist --target node --format esm --packages external --sourcemap=linked --banner=\"/*! Copyright 2026 Martin Winkler. SPDX-License-Identifier: Apache-2.0 */\"",
+    "typecheck": "tsc --noEmit -p tsconfig.json && bun run test:types",
+    "test": "bun test --only-failures && bun run test:types",
+    "test:types": "tsc --noEmit -p tsconfig.test.json",
+    "test:live": "bun test --timeout 150000 ./tests/live/developer.live.ts",
+    "test:live:vertex": "bun test --timeout 2700000 ./tests/live/vertex.live.ts",
+    "test:live:embed": "bun test --timeout 60000 ./tests/live/embed.live.ts",
+    "test:live:batch": "bun test --timeout 7200000 ./tests/live/batch.live.ts",
+    "test:dist": "node tests/smoke/smoke.mjs && node tests/smoke/smoke.cjs",
+    "test:package": "attw --pack . --profile esm-only",
+    "coverage": "bun test --coverage",
+    "lint": "biome check --error-on-warnings .",
+    "lint:fix": "biome check --write .",
+    "lint:ci": "biome ci --error-on-warnings .",
+    "check": "bun run lint:ci && bun run test && bun run build && bun run test:dist && bun run test:package",
+    "prepublishOnly": "bun run check"
+  },
+  "devDependencies": {
+    "@arethetypeswrong/cli": "^0.18.5",
+    "@biomejs/biome": "2.5.14",
+    "@types/bun": "^1.4.0",
+    "@types/node": "^22.12.0",
+    "bun-test-runner": "latest",
+    "smartin": "latest",
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "@google/genai": "^2.31.0",
+    "google-auth-library": "^10.9.1",
+    "smart-limit": "^0.1.0"
+  }
+}
