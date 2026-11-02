@@ -4,6 +4,8 @@
 import type { GenerateContentConfig } from '@google/genai';
 import {
     createGenaiClient,
+    type GenaiBatchCheckOptions,
+    type GenaiBatchJob,
     type GenaiError,
     type GenaiOutput,
     type GenaiRequest,
@@ -19,6 +21,10 @@ const request: GenaiRequest = {
 };
 const _pending: Promise<Result<GenaiOutput, unknown>> = createGenaiClient({ apiKey: 'k' }).generate(request);
 const _bytes: Result<number, GenaiError> | undefined = createGenaiClient({ apiKey: 'k' }).batch?.requestBytes(request);
+const _jobs: Promise<Result<GenaiBatchJob[], GenaiError>> | undefined = createGenaiClient({ apiKey: 'k' }).batch?.list({
+    displayName: 'run',
+});
+const _checkOptions: GenaiBatchCheckOptions = { keepFiles: true };
 const _merged: GenerateContentConfig | undefined = mergeGenaiConfig({ temperature: 0 }, undefined, { topK: 1 });
 // biome-ignore lint/suspicious/noConfusingVoidType: assert validateGenaiConfig returns void
 const _validated: void = validateGenaiConfig({ temperature: 0 }, 'config');

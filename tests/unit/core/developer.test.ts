@@ -516,6 +516,53 @@ describe('batch on the Developer API', () => {
         ]);
     });
 
+    it('accepts keepFiles on check, as there are no files to remove', async () => {
+        server.reply(() => batchResponse('batches/b1', 'BATCH_STATE_SUCCEEDED', []));
+        expect(await client().batch?.check('batches/b1', { keepFiles: true })).toEqual({
+            ok: true,
+            data: { name: 'batches/b1', state: 'JOB_STATE_SUCCEEDED', phase: 'succeeded', results: [] },
+        });
+    });
+
+    it('lists batch jobs, filtered by display name', async () => {
+        /** Batch operation as returned in list pages. */
+        function operation(name: string, displayName: string, state: string): Record<string, unknown> {
+            return { name, metadata: { name, displayName, state, createTime: '2026-01-01T00:00:00Z' } };
+        }
+        server.reply(() =>
+            Response.json({
+                operations: [
+                    operation('batches/b1', 'run-1', 'BATCH_STATE_SUCCEEDED'),
+                    operation('batches/b2', 'run-2', 'BATCH_STATE_RUNNING'),
+                ],
+            }),
+        );
+        expect(await client().batch?.list()).toEqual({
+            ok: true,
+            data: [
+                {
+                    name: 'batches/b1',
+                    displayName: 'run-1',
+                    state: 'JOB_STATE_SUCCEEDED',
+                    phase: 'succeeded',
+                    createTime: '2026-01-01T00:00:00Z',
+                },
+                {
+                    name: 'batches/b2',
+                    displayName: 'run-2',
+                    state: 'JOB_STATE_RUNNING',
+                    phase: 'running',
+                    createTime: '2026-01-01T00:00:00Z',
+                },
+            ],
+        });
+        expect([server.received[0]?.method, server.received[0]?.path]).toEqual(['GET', '/v1beta/batches']);
+        const named = await client().batch?.list({ displayName: 'run-2' });
+        expect(named?.ok && named.data.map((job) => job.name)).toEqual(['batches/b2']);
+        server.reply(() => apiError(403));
+        expect(await client().batch?.list()).toMatchObject({ ok: false, error: { code: 'http', status: 403 } });
+    });
+
     it('answers unsupported for removeFiles without any call', async () => {
         server.received.length = 0;
         expect(await client().batch?.removeFiles()).toEqual({

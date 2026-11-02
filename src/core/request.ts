@@ -349,9 +349,19 @@ export function checkOptionKeys(options: unknown, allowed: ReadonlySet<string>, 
             throw new InvalidRequestError(`Option "${prefix}${key}" is not supported`);
         }
     }
-    const { signal, displayName } = options as { signal?: unknown; displayName?: unknown };
+    const { signal, displayName, keepFiles, keepSucceededMs } = options as Record<string, unknown>;
     if (allowed.has('signal') && signal !== undefined && !(signal instanceof AbortSignal)) {
         throw new InvalidRequestError(`Invalid value for option "${prefix}signal"`);
+    }
+    if (allowed.has('keepFiles') && keepFiles !== undefined && typeof keepFiles !== 'boolean') {
+        throw new InvalidRequestError(`Invalid value for option "${prefix}keepFiles": true or false`);
+    }
+    if (
+        allowed.has('keepSucceededMs') &&
+        keepSucceededMs !== undefined &&
+        (typeof keepSucceededMs !== 'number' || !Number.isFinite(keepSucceededMs) || keepSucceededMs < 0)
+    ) {
+        throw new InvalidRequestError(`Invalid value for option "${prefix}keepSucceededMs"`);
     }
     if (
         allowed.has('displayName') &&

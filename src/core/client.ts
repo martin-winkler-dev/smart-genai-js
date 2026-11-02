@@ -292,6 +292,7 @@ function withDefaults(batch: GenaiBatch, withBatch: GenaiDefaults): GenaiBatch {
         },
         check: batch.check,
         cancel: batch.cancel,
+        list: batch.list,
         removeFiles: batch.removeFiles,
     });
 }

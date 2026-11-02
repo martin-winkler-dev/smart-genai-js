@@ -327,13 +327,40 @@ export type GenaiBatchStatus = {
 export type GenaiBatchOptions = { signal?: AbortSignal; displayName?: string; config?: GenerateContentConfig };
 
 /**
+ * **Options for batch status checks**.
+ *
+ * - `keepFiles`: keeps bucket files of final job on Vertex AI, so `check` can be repeated (default `false`)
+ */
+export type GenaiBatchCheckOptions = { signal?: AbortSignal; keepFiles?: boolean };
+
+/** Options for listing batch jobs; `displayName` keeps only jobs with exactly this name. */
+export type GenaiBatchListOptions = { signal?: AbortSignal; displayName?: string };
+
+/**
+ * **Options for removing batch files**.
+ *
+ * - `keepSucceededMs`: keeps folders of succeeded jobs this long after job end (default 7 days)
+ */
+export type GenaiBatchRemoveOptions = { signal?: AbortSignal; keepSucceededMs?: number };
+
+/** Batch job found by `list`; `createTime` as RFC 3339 when known. */
+export type GenaiBatchJob = {
+    name: string;
+    displayName?: string;
+    state: string;
+    phase: GenaiBatchStatus['phase'];
+    createTime?: string;
+};
+
+/**
  * **Batch operations interface**.
  *
  * - `maxBytes`: size limit for single batch submission
  * - `requestBytes`: calculates encoded byte size of request
  * - `submit`: creates batch job for multiple items sharing one model
- * - `check`: checks job status and downloads completed results
- * - `cancel`: cancels active batch job
+ * - `check`: checks job status and downloads completed results; final job's bucket files removed unless `keepFiles`
+ * - `cancel`: cancels active batch job; on Vertex AI also removes its bucket files, also of final job
+ * - `list`: lists batch jobs without changing anything, e.g. to find job whose name was lost
  * - `removeFiles`: removes orphaned batch files from Cloud Storage
  */
 export type GenaiBatch = {
@@ -343,16 +370,24 @@ export type GenaiBatch = {
         items: readonly GenaiBatchItem[],
         options?: GenaiBatchOptions,
     ): Promise<Result<GenaiBatchStatus, GenaiError>>;
-    check(name: string, options?: { signal?: AbortSignal }): Promise<Result<GenaiBatchStatus, GenaiError>>;
+    check(name: string, options?: GenaiBatchCheckOptions): Promise<Result<GenaiBatchStatus, GenaiError>>;
     cancel(name: string, options?: { signal?: AbortSignal }): Promise<Result<void, GenaiError>>;
+    /**
+     * **Lists batch jobs**.
+     *
+     * - Vertex AI: only jobs reading `smart-genai/<id>/` input in configured bucket
+     * - Developer API: all batch jobs of API key's project
+     */
+    list(options?: GenaiBatchListOptions): Promise<Result<GenaiBatchJob[], GenaiError>>;
     /**
      * **Removes orphaned batch folders from Cloud Storage**.
      *
      * - deletes `smart-genai/<id>/` folders not associated with running jobs
+     * - keeps folders of succeeded jobs within `keepSucceededMs` after job end (unknown end: kept)
      * - preserves folders with recent uploads (grace period)
      * - non-applicable for Developer API (returns `unsupported`)
      */
-    removeFiles(options?: { signal?: AbortSignal }): Promise<Result<{ removed: number; kept: number }, GenaiError>>;
+    removeFiles(options?: GenaiBatchRemoveOptions): Promise<Result<{ removed: number; kept: number }, GenaiError>>;
 };
 
 /**
@@ -502,7 +537,7 @@ export type GenaiModelBatch = {
         items: readonly { key: string; request: Omit<GenaiRequest, 'model'> }[],
         options?: GenaiBatchOptions,
     ): Promise<Result<GenaiBatchStatus, GenaiError>>;
-    check(name: string, options?: { signal?: AbortSignal }): Promise<Result<GenaiBatchStatus, GenaiError>>;
+    check(name: string, options?: GenaiBatchCheckOptions): Promise<Result<GenaiBatchStatus, GenaiError>>;
     cancel(name: string, options?: { signal?: AbortSignal }): Promise<Result<void, GenaiError>>;
 };
 

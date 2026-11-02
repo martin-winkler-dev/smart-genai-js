@@ -315,8 +315,25 @@ const status = await vertex.batch?.check(submitted.data.name);
   (configured via `vertex.bucket` or env `VERTEX_BATCH_BUCKET`, bucket name without `gs://`; up to 100 MB per submission). Without
   a bucket, `vertex.batch` (and `gemini.<model>.batch`) is `undefined`. On `submit`, requests are uploaded to
   `gs://<bucket>/smart-genai/<uuid>/input.jsonl`, and Vertex AI writes results to `.../output/.../predictions.jsonl`. When `check`
-  observes a terminal state (`succeeded` or `failed`), it reads the results (if succeeded) and deletes the job's bucket folder. If
-  downloading output fails, the files remain in the bucket so a subsequent `check` can retry.
+  observes a terminal state (`succeeded` or `failed`), it reads the results (if succeeded) and deletes the job's bucket folder
+  (unless `keepFiles: true` is set). If downloading output fails, the files remain in the bucket so a subsequent `check` can retry.
+- **Keeping results until stored (`check(name, { keepFiles: true })`)**: returns the results of a terminal job without deleting its
+  bucket folder, allowing `check` to be called again (e.g. if the process crashes before persisting the results). Once stored,
+  delete the folder via `cancel(name)` (which removes bucket files without re-cancelling a finished job), `removeFiles()`, or a
+  bucket lifecycle rule. On the Developer API, responses remain inline on the job resource, so `keepFiles` is a no-op.
+  ```ts
+  const done = await vertex.batch?.check(name, { keepFiles: true });
+  if (done?.ok && done.data.phase !== 'running') {
+      await store(done.data); // your persistence
+      await vertex.batch?.cancel(name); // removes the job's bucket folder
+  }
+  ```
+- **Finding jobs (`list({ displayName? })`)**: returns `[{ name, displayName?, state, phase, createTime? }]` without modifying jobs
+  or bucket files. On Vertex AI, it lists only jobs whose input is in `smart-genai/<uuid>/` in the configured bucket; on the
+  Developer API, it lists all batch jobs. To recover a job whose name was lost (e.g. if the process exited before `submit`
+  returned), persist a unique `displayName` before calling `submit(items, { displayName })` and look it up via
+  `list({ displayName })` (the default `smart-genai <n> requests` is not unique). Named model batch interfaces do not expose
+  `list`; use `client.batch.list()`.
 - **Key encoding on Vertex AI**: keys are prefixed with `j:<key>` (JSON formats) or `t:<key>` (text) to prevent BigQuery and
   JSONL importers from coercing numeric string keys into numbers. Checking an already-cleaned-up job returns `unexpected`.
 - **Developer API**: requests and responses are exchanged inline directly within the Batch API payload (< 19 MB per submission; no
@@ -328,13 +345,14 @@ const status = await vertex.batch?.check(submitted.data.name);
   are translated on Developer API; transient Vertex AI errors are classified as retryable).
 - **Job cancellation**: `cancel(name)` requests job cancellation. On Vertex AI, it also removes temporary bucket files. If a
   job is already finished, `cancel` cleans up remaining files without re-cancelling the job.
-- **Orphaned file cleanup (`removeFiles()`)**: deletes leftover batch folders on Vertex AI, returning `{ removed, kept }`.
-  All batch files reside in `smart-genai/<uuid>/`. `removeFiles` lists active Vertex batch jobs and keeps folders belonging to
-  non-terminal jobs (queued, pending, running, cancelling) and folders with any object younger than one hour (or with an unknown
-  creation timestamp). It deletes all other folders under `smart-genai/`—including output of finished jobs that were never read
-  via `check`, so call `removeFiles()` only after pending `check` calls for stored jobs have completed, not blindly at startup.
-  It never touches files outside `smart-genai/`, is never called automatically, and returns `unsupported` on the Developer API.
-  Named model batch interfaces do not expose `removeFiles`; use `client.batch.removeFiles()`.
+- **Orphaned file cleanup (`removeFiles({ keepSucceededMs? })`)**: deletes leftover batch folders on Vertex AI, returning
+  `{ removed, kept }`. All batch files reside in `smart-genai/<uuid>/`. `removeFiles` lists Vertex batch jobs and retains folders
+  belonging to non-terminal jobs (queued, pending, running, cancelling), folders of succeeded jobs that ended less than
+  `keepSucceededMs` ago (default 7 days; unknown end time is treated as recent), and folders with any object younger than one hour
+  (or with an unknown creation timestamp). It deletes all other folders under `smart-genai/`, including output of older succeeded
+  jobs that was never read via `check` (pass `{ keepSucceededMs: 0 }` to retain no succeeded jobs' folders beyond the one-hour
+  object grace period). It never touches files outside `smart-genai/`, is never called automatically, and returns `unsupported` on
+  the Developer API. Named model batch interfaces do not expose `removeFiles`; use `client.batch.removeFiles()`.
 
 ## Batch calls
 
@@ -372,7 +390,8 @@ const [a, b] = await Promise.all([
   tier does not support batch jobs (`FAILED_PRECONDITION`); batch operations require a paid project with billing enabled.
 - **In-memory lifecycle**: batch calls and pollers live in application memory and are not persisted. If the host process exits,
   in-flight call promises are lost while submitted jobs continue running in Google Cloud. For long-running workflows that must
-  survive restarts, use `client.batch.submit` and `client.batch.check` with your own persistence layer.
+  survive restarts, use `client.batch.submit` and `client.batch.check` with your own persistence layer (`keepFiles` and `list`
+  for crash recovery, see [Batch](#batch)).
 - **Concurrency with named models**: batch calls executed through named models wait only for the model's own
   `modelLimits.concurrency` (tracked separately from synchronous calls). They do not consume shared limits, token buckets,
   or interval limits, and do not trigger synchronous queue locks upon encountering 429 errors.

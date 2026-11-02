@@ -18,7 +18,7 @@ import type {
     GenaiRequest,
     Result,
 } from '../../types.js';
-import { batchPhase, guardBatch, readAnswer, statusError, toGenaiError } from '../answer.js';
+import { batchPhase, guardBatch, listBatchJobs, readAnswer, statusError, toGenaiError } from '../answer.js';
 import { batchModel, checkBatchName, checkOptionKeys, toGeminiCall, wantsJson } from '../request.js';
 import type { GcsClient } from './gcs.js';
 
@@ -48,8 +48,20 @@ const SUBMIT_OPTION_KEYS: ReadonlySet<string> = new Set(['signal', 'displayName'
 /** Grace period in milliseconds before unreferenced folders can be deleted. */
 const REMOVE_GRACE_MS = 3_600_000;
 
-/** Supported option keys for batch status checks and cancellation. */
-const CHECK_OPTION_KEYS: ReadonlySet<string> = new Set(['signal']);
+/** Default time folders of succeeded jobs are kept by `removeFiles` after job end (7 days). */
+const KEEP_SUCCEEDED_MS = 7 * 24 * 3_600_000;
+
+/** Supported option keys for batch status checks. */
+const CHECK_OPTION_KEYS: ReadonlySet<string> = new Set(['signal', 'keepFiles']);
+
+/** Supported option keys for batch cancellation. */
+const CANCEL_OPTION_KEYS: ReadonlySet<string> = new Set(['signal']);
+
+/** Supported option keys for batch job listing. */
+const LIST_OPTION_KEYS: ReadonlySet<string> = new Set(['signal', 'displayName']);
+
+/** Supported option keys for batch file removal. */
+const REMOVE_OPTION_KEYS: ReadonlySet<string> = new Set(['signal', 'keepSucceededMs']);
 
 /** Matches line key with format prefix (`j:` for JSON, `t:` for text). */
 const MATCH_LINE_KEY = /^([jt]):([\s\S]+)$/;
@@ -83,7 +95,7 @@ const MATCH_PUBLISHER_MODEL_PREFIX = /^publishers\/google\/models\//;
  *
  * - uploads input requests to `smart-genai/<uuid>/input.jsonl`
  * - polls batch job and reads results from `predictions.jsonl`
- * - cleans up temporary bucket files after completion
+ * - cleans up temporary bucket files after completion, unless `check` gets `keepFiles`
  * - parses output line errors and distinguishes transient failures
  */
 export function createVertexBatch(ai: GoogleGenAI, gcs: GcsClient): GenaiBatch {
@@ -161,14 +173,14 @@ export function createVertexBatch(ai: GoogleGenAI, gcs: GcsClient): GenaiBatch {
                 }));
                 status = { ...status, results };
             }
-            if (folder !== undefined) {
+            if (folder !== undefined && options.keepFiles !== true) {
                 await removeFolder(gcs, folder);
             }
             return { ok: true, data: status };
         },
         async cancel(name, options = {}) {
             checkBatchName(name);
-            checkOptionKeys(options, CHECK_OPTION_KEYS);
+            checkOptionKeys(options, CANCEL_OPTION_KEYS);
             const { signal } = options;
             const config = signal ? { config: { abortSignal: signal } } : {};
             let job: BatchJob;
@@ -187,10 +199,14 @@ export function createVertexBatch(ai: GoogleGenAI, gcs: GcsClient): GenaiBatch {
             }
             return { ok: true, data: undefined };
         },
+        async list(options = {}) {
+            checkOptionKeys(options, LIST_OPTION_KEYS);
+            return listBatchJobs(ai, options, (job) => batchFolder(job, gcs.bucket) !== undefined);
+        },
         async removeFiles(options = {}) {
-            checkOptionKeys(options, CHECK_OPTION_KEYS);
-            const { signal } = options;
-            const inUse = await runningFolders(ai, gcs.bucket, signal);
+            checkOptionKeys(options, REMOVE_OPTION_KEYS);
+            const { signal, keepSucceededMs = KEEP_SUCCEEDED_MS } = options;
+            const inUse = await usedFolders(ai, gcs.bucket, keepSucceededMs, signal);
             if (!inUse.ok) {
                 return inUse;
             }
@@ -352,18 +368,29 @@ function readOutputLine(line: OutputLine, json: boolean, model: string): Result<
     return readAnswer(line.response, model, json, 0);
 }
 
-/** Discovers active batch bucket folders currently referenced by running jobs. */
-async function runningFolders(
+/**
+ * **Discovers batch bucket folders still in use**.
+ *
+ * - folders of running jobs
+ * - folders of succeeded jobs ended less than `keepSucceededMs` ago, results maybe not stored yet
+ * - unknown end time (`endTime`, else `updateTime`) counts as recent
+ */
+async function usedFolders(
     ai: GoogleGenAI,
     bucket: string,
+    keepSucceededMs: number,
     signal: AbortSignal | undefined,
 ): Promise<Result<Set<string>, GenaiError>> {
     const prefix = `gs://${bucket}/`;
     const folders = new Set<string>();
+    const now = Date.now();
     try {
         const pager = await ai.batches.list({ config: { pageSize: 100, ...(signal ? { abortSignal: signal } : {}) } });
         for await (const job of pager) {
-            if (!job || batchPhase(job.state ?? 'JOB_STATE_UNSPECIFIED') !== 'running') {
+            const phase = job ? batchPhase(job.state ?? 'JOB_STATE_UNSPECIFIED') : 'failed';
+            const ended = Date.parse(job?.endTime ?? job?.updateTime ?? '');
+            const isRecent = Number.isNaN(ended) || now - ended < keepSucceededMs;
+            if (!job || !(phase === 'running' || (phase === 'succeeded' && isRecent))) {
                 continue;
             }
             for (const uri of [...(job.src?.gcsUri ?? []), job.dest?.gcsUri ?? '']) {

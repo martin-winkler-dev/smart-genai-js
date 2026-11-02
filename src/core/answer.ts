@@ -4,12 +4,15 @@
 import { randomUUID } from 'node:crypto';
 import {
     ApiError,
+    type BatchJob,
     type GenerateContentResponse,
     type GenerateContentResponseUsageMetadata,
+    type GoogleGenAI,
     type Part,
 } from '@google/genai';
 import type {
     GenaiBatch,
+    GenaiBatchJob,
     GenaiBatchStatus,
     GenaiError,
     GenaiOutput,
@@ -214,6 +217,35 @@ export function batchPhase(state: string): GenaiBatchStatus['phase'] {
     return FAILED_STATES.has(state) ? 'failed' : 'running';
 }
 
+/** Lists batch jobs of all pages, kept by `accept` and by `displayName` when given. */
+export async function listBatchJobs(
+    ai: GoogleGenAI,
+    options: { displayName?: string; signal?: AbortSignal },
+    accept: (job: BatchJob) => boolean = () => true,
+): Promise<Result<GenaiBatchJob[], GenaiError>> {
+    const { displayName, signal } = options;
+    const jobs: GenaiBatchJob[] = [];
+    try {
+        const pager = await ai.batches.list({ config: { pageSize: 100, ...(signal ? { abortSignal: signal } : {}) } });
+        for await (const job of pager) {
+            if (!job?.name || (displayName !== undefined && job.displayName !== displayName) || !accept(job)) {
+                continue;
+            }
+            const state = job.state ?? 'JOB_STATE_UNSPECIFIED';
+            jobs.push({
+                name: job.name,
+                ...(job.displayName ? { displayName: job.displayName } : {}),
+                state,
+                phase: batchPhase(state),
+                ...(job.createTime ? { createTime: job.createTime } : {}),
+            });
+        }
+    } catch (error) {
+        return { ok: false, error: toGenaiError(error, signal) };
+    }
+    return { ok: true, data: jobs };
+}
+
 /** Wraps async function to ensure it never throws; maps rejections to `GenaiError`. */
 export function guard<A extends unknown[], T>(
     call: (...args: A) => Promise<Result<T, GenaiError>>,
@@ -242,7 +274,7 @@ export function guardSync<A extends unknown[], T>(
 
 /** Wraps all methods of `GenaiBatch` to guarantee they never throw or reject. */
 export function guardBatch<
-    B extends Omit<GenaiBatch, 'maxBytes' | 'removeFiles'> & { removeFiles?: GenaiBatch['removeFiles'] },
+    B extends Omit<GenaiBatch, 'maxBytes' | 'list' | 'removeFiles'> & Partial<Pick<GenaiBatch, 'list' | 'removeFiles'>>,
 >(batch: B): B {
     return {
         ...batch,
@@ -250,6 +282,7 @@ export function guardBatch<
         submit: guard(batch.submit),
         check: guard(batch.check),
         cancel: guard(batch.cancel),
+        ...(batch.list === undefined ? {} : { list: guard(batch.list) }),
         ...(batch.removeFiles === undefined ? {} : { removeFiles: guard(batch.removeFiles) }),
     };
 }

@@ -280,6 +280,54 @@ describe('batch on Vertex AI', () => {
         });
     });
 
+    it('keeps the files with keepFiles, so check can be repeated, and cancel removes them afterwards', async () => {
+        const vertex = client();
+        const { name, folder } = await submitTwo(vertex);
+        server.jobs.set(name, { ...server.jobs.get(name), state: 'JOB_STATE_SUCCEEDED' });
+        server.objects.set(
+            `${folder}/output/predictions.jsonl`,
+            JSON.stringify({ key: 'j:7', response: generateBody('{"kind":"noun"}') }),
+        );
+        for (let round = 0; round < 2; round++) {
+            const kept = await vertex.batch?.check(name, { keepFiles: true });
+            expect(kept?.ok && kept.data.results?.map((item) => item.key)).toEqual(['7']);
+            expect(server.objects.size).toBe(2);
+        }
+        const defaults = createGenaiClient({
+            vertex: { project: 'p', bucket: 'bkt', authClient: fakeAuthClient(), storageUrl: server.baseUrl },
+            env: {},
+            baseUrl: server.baseUrl,
+            defaults: { temperature: 0 },
+        });
+        expect((await defaults.batch?.check(name, { keepFiles: true }))?.ok).toBe(true);
+        expect(server.objects.size).toBe(2);
+        server.received.length = 0;
+        expect(await vertex.batch?.cancel(name)).toEqual({ ok: true, data: undefined });
+        expect(server.received.some((entry) => entry.path.endsWith(':cancel'))).toBe(false);
+        expect(server.objects.size).toBe(0);
+    });
+
+    it('removes the files of a final job with keepFiles false, and rejects keepFiles that is no boolean', async () => {
+        const vertex = client();
+        const { name } = await submitTwo(vertex);
+        server.jobs.set(name, { ...server.jobs.get(name), state: 'JOB_STATE_FAILED' });
+        expect(await vertex.batch?.check(name, { keepFiles: 'yes' } as never)).toEqual({
+            ok: false,
+            error: {
+                code: 'invalid_request',
+                message: 'Invalid value for option "keepFiles": true or false',
+                retryable: false,
+            },
+        });
+        expect(await vertex.batch?.cancel(name, { keepFiles: true } as never)).toMatchObject({
+            ok: false,
+            error: { code: 'invalid_request', message: 'Option "keepFiles" is not supported' },
+        });
+        expect(server.objects.size).toBe(1);
+        expect((await vertex.batch?.check(name, { keepFiles: false }))?.ok).toBe(true);
+        expect(server.objects.size).toBe(0);
+    });
+
     it('keeps digit-only keys as written', async () => {
         const vertex = client();
         const submitted = await vertex.batch?.submit([{ key: '007', request }]);
@@ -337,18 +385,93 @@ describe('batch on Vertex AI', () => {
     });
 });
 
-describe('removeFiles on Vertex AI', () => {
-    /** Populates fake server with batch prediction job referencing specified folder. */
-    function seedJob(id: number, state: string, folder: string, bucket = 'bkt'): void {
-        const name = `projects/p/locations/us-central1/batchPredictionJobs/${id}`;
-        server.jobs.set(name, {
-            name,
-            state,
-            inputConfig: { gcsSource: { uris: [`gs://${bucket}/${folder}/input.jsonl`] } },
-            outputConfig: { gcsDestination: { outputUriPrefix: `gs://${bucket}/${folder}/output/` } },
-        });
-    }
+/** Populates fake server with batch prediction job referencing specified folder. */
+function seedJob(id: number, state: string, folder: string, bucket = 'bkt', extra: Record<string, unknown> = {}): void {
+    const name = `projects/p/locations/us-central1/batchPredictionJobs/${id}`;
+    server.jobs.set(name, {
+        name,
+        state,
+        inputConfig: { gcsSource: { uris: [`gs://${bucket}/${folder}/input.jsonl`] } },
+        outputConfig: { gcsDestination: { outputUriPrefix: `gs://${bucket}/${folder}/output/` } },
+        ...extra,
+    });
+}
 
+/** Time `ms` milliseconds ago as RFC 3339. */
+function ago(ms: number): string {
+    return new Date(Date.now() - ms).toISOString();
+}
+
+describe('list on Vertex AI', () => {
+    it('lists jobs of smart-genai folders in the bucket over all pages, and removes nothing', async () => {
+        seedJob(1, 'JOB_STATE_SUCCEEDED', 'smart-genai/a', 'bkt', {
+            displayName: 'run-1',
+            createTime: '2026-01-01T00:00:00Z',
+        });
+        seedJob(2, 'JOB_STATE_RUNNING', 'smart-genai/b', 'bkt', { displayName: 'run-2' });
+        seedJob(3, 'JOB_STATE_FAILED', 'smart-genai/c');
+        seedJob(4, 'JOB_STATE_RUNNING', 'smart-genai/d', 'other-bucket', { displayName: 'run-1' });
+        seedJob(5, 'JOB_STATE_RUNNING', 'data', 'bkt', { displayName: 'run-1' });
+        server.jobs.set('null', null as never);
+        server.objects.set('smart-genai/a/input.jsonl', 'x');
+        const listed = await client().batch?.list();
+        expect(listed).toEqual({
+            ok: true,
+            data: [
+                {
+                    name: 'projects/p/locations/us-central1/batchPredictionJobs/1',
+                    displayName: 'run-1',
+                    state: 'JOB_STATE_SUCCEEDED',
+                    phase: 'succeeded',
+                    createTime: '2026-01-01T00:00:00Z',
+                },
+                {
+                    name: 'projects/p/locations/us-central1/batchPredictionJobs/2',
+                    displayName: 'run-2',
+                    state: 'JOB_STATE_RUNNING',
+                    phase: 'running',
+                },
+                {
+                    name: 'projects/p/locations/us-central1/batchPredictionJobs/3',
+                    state: 'JOB_STATE_FAILED',
+                    phase: 'failed',
+                },
+            ],
+        });
+        const named = await client().batch?.list({ displayName: 'run-1' });
+        expect(named?.ok && named.data.map((job) => job.name)).toEqual([
+            'projects/p/locations/us-central1/batchPredictionJobs/1',
+        ]);
+        expect(server.objects.size).toBe(1);
+        expect(server.received.some((entry) => entry.method !== 'GET')).toBe(false);
+    });
+
+    it('finds a job submitted with a display name, the way to recover a lost job name', async () => {
+        const vertex = client();
+        const submitted = await vertex.batch?.submit([{ key: '1', request }], { displayName: 'doc-42' });
+        const listed = await vertex.batch?.list({ displayName: 'doc-42' });
+        expect(listed?.ok && listed.data.map((job) => job.name)).toEqual([submitted?.ok ? submitted.data.name : '']);
+    });
+
+    it('answers listing errors and invalid options', async () => {
+        server.failList = 'jobs';
+        try {
+            expect(await client().batch?.list()).toMatchObject({ ok: false, error: { code: 'http', retryable: true } });
+        } finally {
+            server.failList = undefined;
+        }
+        expect(await client().batch?.list({ displayName: '' })).toMatchObject({
+            ok: false,
+            error: { code: 'invalid_request', message: 'Invalid value for option "displayName"' },
+        });
+        expect(await client().batch?.list({ keepFiles: true } as never)).toMatchObject({
+            ok: false,
+            error: { code: 'invalid_request', message: 'Option "keepFiles" is not supported' },
+        });
+    });
+});
+
+describe('removeFiles on Vertex AI', () => {
     /** Populates fake storage bucket with batch folders and external test objects. */
     function seedObjects(): void {
         for (const name of [
@@ -368,7 +491,7 @@ describe('removeFiles on Vertex AI', () => {
 
     it('removes stale folders, keeps folders of jobs not final yet and leaves objects outside the prefix', async () => {
         seedObjects();
-        seedJob(1, 'JOB_STATE_SUCCEEDED', 'smart-genai/a');
+        seedJob(1, 'JOB_STATE_SUCCEEDED', 'smart-genai/a', 'bkt', { endTime: ago(8 * 24 * 3_600_000) });
         seedJob(2, 'JOB_STATE_RUNNING', 'smart-genai/c');
         seedJob(3, 'JOB_STATE_CANCELLING', 'smart-genai/d');
         seedJob(4, 'JOB_STATE_QUEUED', 'smart-genai/e');
@@ -400,6 +523,39 @@ describe('removeFiles on Vertex AI', () => {
         expect(server.objects.has('smart-genai/b/input.jsonl')).toBe(true);
         expect(server.objects.has('smart-genai/c/input.jsonl')).toBe(false);
         expect([...server.objects.keys()].filter((name) => name.endsWith('/input.jsonl'))).toHaveLength(3);
+    });
+
+    it('keeps folders of succeeded jobs within keepSucceededMs after job end, or of unknown end', async () => {
+        for (const folder of ['a', 'b', 'c', 'd', 'e']) {
+            server.objects.set(`smart-genai/${folder}/input.jsonl`, 'x');
+        }
+        seedJob(1, 'JOB_STATE_SUCCEEDED', 'smart-genai/a', 'bkt', { endTime: ago(6 * 24 * 3_600_000) });
+        seedJob(2, 'JOB_STATE_SUCCEEDED', 'smart-genai/b', 'bkt', { updateTime: ago(3_600_000) });
+        seedJob(3, 'JOB_STATE_SUCCEEDED', 'smart-genai/c');
+        seedJob(4, 'JOB_STATE_SUCCEEDED', 'smart-genai/d', 'bkt', { endTime: ago(8 * 24 * 3_600_000) });
+        seedJob(5, 'JOB_STATE_FAILED', 'smart-genai/e', 'bkt', { endTime: ago(3_600_000) });
+        expect(await client().batch?.removeFiles()).toEqual({ ok: true, data: { removed: 2, kept: 3 } });
+        expect([...server.objects.keys()].sort()).toEqual([
+            'smart-genai/a/input.jsonl',
+            'smart-genai/b/input.jsonl',
+            'smart-genai/c/input.jsonl',
+        ]);
+        expect(await client().batch?.removeFiles({ keepSucceededMs: 2 * 3_600_000 })).toEqual({
+            ok: true,
+            data: { removed: 1, kept: 2 },
+        });
+        expect(server.objects.has('smart-genai/a/input.jsonl')).toBe(false);
+        expect(await client().batch?.removeFiles({ keepSucceededMs: 0 })).toEqual({
+            ok: true,
+            data: { removed: 1, kept: 1 },
+        });
+        expect([...server.objects.keys()]).toEqual(['smart-genai/c/input.jsonl']);
+        for (const keepSucceededMs of [-1, Number.NaN, '1']) {
+            expect(await client().batch?.removeFiles({ keepSucceededMs } as never)).toMatchObject({
+                ok: false,
+                error: { code: 'invalid_request', message: 'Invalid value for option "keepSucceededMs"' },
+            });
+        }
     });
 
     it('reports an empty bucket as nothing removed', async () => {
@@ -448,6 +604,7 @@ describe('removeFiles on Vertex AI', () => {
             await batch?.submit([{ key: 'a', request }], signal),
             await batch?.check('batchPredictionJobs/1', signal),
             await batch?.cancel('batchPredictionJobs/1', signal),
+            await batch?.list(signal),
             await batch?.removeFiles(signal),
         ];
         for (const result of results) {

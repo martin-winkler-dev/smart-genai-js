@@ -8,8 +8,12 @@ export { assistantMessage, toolMessage } from './core/messages.js';
 export { mergeGenaiConfig, validateGenaiConfig } from './core/request.js';
 export type {
     GenaiBatch,
+    GenaiBatchCheckOptions,
     GenaiBatchItem,
+    GenaiBatchJob,
+    GenaiBatchListOptions,
     GenaiBatchOptions,
+    GenaiBatchRemoveOptions,
     GenaiBatchResult,
     GenaiBatchStatus,
     GenaiCallOptions,

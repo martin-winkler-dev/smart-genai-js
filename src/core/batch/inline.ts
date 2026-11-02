@@ -11,7 +11,7 @@ import type {
     GenaiRequest,
     Result,
 } from '../../types.js';
-import { batchPhase, guardBatch, readAnswer, rpcError, toGenaiError } from '../answer.js';
+import { batchPhase, guardBatch, listBatchJobs, readAnswer, rpcError, toGenaiError } from '../answer.js';
 import { batchModel, checkBatchName, checkOptionKeys, toGeminiCall, wantsJson } from '../request.js';
 
 // -------------------------------------------------------------------
@@ -27,8 +27,17 @@ const JSON_FORMAT = 'json';
 /** Supported option keys for batch submission. */
 const SUBMIT_OPTION_KEYS: ReadonlySet<string> = new Set(['signal', 'displayName', 'config']);
 
-/** Supported option keys for batch status checks and cancellation. */
-const CHECK_OPTION_KEYS: ReadonlySet<string> = new Set(['signal']);
+/** Supported option keys for batch status checks; `keepFiles` accepted for Vertex AI parity, no files here. */
+const CHECK_OPTION_KEYS: ReadonlySet<string> = new Set(['signal', 'keepFiles']);
+
+/** Supported option keys for batch cancellation. */
+const CANCEL_OPTION_KEYS: ReadonlySet<string> = new Set(['signal']);
+
+/** Supported option keys for batch job listing. */
+const LIST_OPTION_KEYS: ReadonlySet<string> = new Set(['signal', 'displayName']);
+
+/** Supported option keys for batch file removal. */
+const REMOVE_OPTION_KEYS: ReadonlySet<string> = new Set(['signal', 'keepSucceededMs']);
 
 /** Matches models/ prefix on model identifiers. */
 const MATCH_MODEL_PREFIX = /^models\//;
@@ -88,7 +97,7 @@ export function createInlineBatch(ai: GoogleGenAI): GenaiBatch {
         },
         async cancel(name, options = {}) {
             checkBatchName(name);
-            checkOptionKeys(options, CHECK_OPTION_KEYS);
+            checkOptionKeys(options, CANCEL_OPTION_KEYS);
             const { signal } = options;
             try {
                 await ai.batches.cancel({ name, ...(signal ? { config: { abortSignal: signal } } : {}) });
@@ -97,8 +106,12 @@ export function createInlineBatch(ai: GoogleGenAI): GenaiBatch {
             }
             return { ok: true, data: undefined };
         },
+        async list(options = {}) {
+            checkOptionKeys(options, LIST_OPTION_KEYS);
+            return listBatchJobs(ai, options);
+        },
         async removeFiles(options = {}) {
-            checkOptionKeys(options, CHECK_OPTION_KEYS);
+            checkOptionKeys(options, REMOVE_OPTION_KEYS);
             const message = 'Developer API batches use no bucket';
             return { ok: false, error: { code: 'unsupported', message, retryable: false } };
         },
