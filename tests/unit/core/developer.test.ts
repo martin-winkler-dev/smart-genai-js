@@ -2,9 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { afterAll, beforeEach, describe, expect, it } from 'bun:test';
+import { inlineBatchLimit } from '../../../src/core/batch/inline.js';
 import { createGenaiClient } from '../../../src/core/client.js';
 import type { GenaiClient, GenaiRequest, GenaiTool } from '../../../src/types.js';
-import { apiError, batchResponse, generateBody, generateResponse, startFakeGemini } from '../fake-gemini.js';
+import {
+    apiError,
+    batchResponse,
+    generateBody,
+    generateResponse,
+    modelsReply,
+    sentBatch,
+    startFakeGemini,
+} from '../fake-gemini.js';
 
 // -------------------------------------------------------------------
 // --- 1. Constants
@@ -122,6 +131,15 @@ describe('generate on the Developer API', () => {
             ok: false,
             error: { code: 'truncated', retryable: false, text: '{"kind":', model: 'gemini-fake-001' },
         });
+        server.reply(() => {
+            const body = generateBody('{"kind":');
+            const [candidate] = body.candidates as Record<string, unknown>[];
+            return Response.json({ ...body, candidates: [{ ...candidate, continuationToken: 'dG9rZW4=' }] });
+        });
+        expect(await client().generate(request)).toMatchObject({
+            ok: false,
+            error: { code: 'truncated', retryable: false, text: '{"kind":', model: 'gemini-fake-001' },
+        });
         server.reply(() =>
             Response.json({ ...generateBody(''), candidates: [], promptFeedback: { blockReason: 'SAFETY' } }),
         );
@@ -197,6 +215,19 @@ describe('generate on the Developer API', () => {
         expect(JSON.stringify(fatal)).not.toContain(TEST_KEY);
     });
 
+    it('falls back to "HTTP <status>" for an empty error message and keeps non-empty messages', async () => {
+        const empty = { code: 'http', status: 404, message: 'HTTP 404', retryable: false, attempts: 1 };
+        server.reply(() => new Response('', { status: 404 }));
+        expect(await client().generate(request)).toMatchObject({ ok: false, error: empty });
+        server.reply(() => new Response('', { status: 404, headers: { 'content-type': 'application/json' } }));
+        expect(await client().generate(request)).toMatchObject({ ok: false, error: empty });
+        server.reply(() => Response.json({ error: { code: 404, message: ' ', status: 'NOT_FOUND' } }, { status: 404 }));
+        expect(await client().generate(request)).toMatchObject({ ok: false, error: empty });
+        server.reply(() => apiError(404));
+        const named = await client().generate(request);
+        expect(!named.ok && named.error.message).toContain('fake 404');
+    });
+
     it('maps an aborted call and an unreachable server, and answers invalid_request for invalid input', async () => {
         const controller = new AbortController();
         controller.abort();
@@ -240,6 +271,21 @@ describe('generate on the Developer API', () => {
             });
         }
         expect(server.received).toHaveLength(0);
+    });
+});
+
+describe('listModels on the Developer API', () => {
+    it('requests pages of 100 models and follows nextPageToken until the last page', async () => {
+        server.reply(modelsReply(Array.from({ length: 230 }, (_, index) => ({ name: `models/m-${index}` }))));
+        const listed = await client().listModels();
+        expect(listed.ok && listed.data.length).toBe(230);
+        expect(listed.ok && listed.data.at(-1)).toEqual({ id: 'm-229', actions: [] });
+        const queries = server.received.map((entry) => new URLSearchParams(entry.search));
+        expect(server.received.map((entry) => `${entry.method} ${entry.path}`)).toEqual(
+            Array(3).fill('GET /v1beta/models'),
+        );
+        expect(queries.map((query) => query.get('pageSize'))).toEqual(['100', '100', '100']);
+        expect(queries.map((query) => query.get('pageToken'))).toEqual([null, '100', '200']);
     });
 });
 
@@ -366,12 +412,9 @@ describe('batch on the Developer API', () => {
         });
         const sent = server.received[0];
         expect(sent?.path).toBe('/v1beta/models/gemini-x:batchGenerateContent');
-        expect(sent?.body?.batch.displayName).toBe('smart-genai 2 requests');
-        const requests = sent?.body?.batch.inputConfig.requests.requests;
-        expect(requests.map((entry: { metadata: unknown }) => entry.metadata)).toEqual([
-            { key: '1', format: 'json' },
-            { key: '2' },
-        ]);
+        expect(sentBatch(sent).displayName).toBe('smart-genai 2 requests');
+        const requests = sentBatch(sent).inputConfig.requests.requests;
+        expect(requests.map((entry) => entry.metadata)).toEqual([{ key: '1', format: 'json' }, { key: '2' }]);
         expect(requests[0].request.generationConfig.responseJsonSchema).toEqual(schema);
         expect(requests[1].request.generationConfig.temperature).toBe(0);
         const bytes = batch?.requestBytes(request);
@@ -396,6 +439,76 @@ describe('batch on the Developer API', () => {
         });
     });
 
+    it('accepts an item with batch undefined as not set and rejects batch true, without defaults', async () => {
+        server.reply(() => batchResponse('batches/b1', 'BATCH_STATE_PENDING'));
+        const batch = client().batch;
+        expect(await batch?.submit([{ key: '1', request: { ...request, batch: undefined } as never }])).toMatchObject({
+            ok: true,
+            data: { name: 'batches/b1' },
+        });
+        const sent = server.received[0];
+        expect(sent?.path).toBe('/v1beta/models/gemini-x:batchGenerateContent');
+        expect(sentBatch(sent).inputConfig.requests.requests[0].request).not.toHaveProperty('batch');
+        expect(await batch?.submit([{ key: '1', request: { ...request, batch: true } }])).toEqual({
+            ok: false,
+            error: {
+                code: 'invalid_request',
+                message: 'Option "batch" is not supported in batch items',
+                retryable: false,
+            },
+        });
+        expect(server.received).toHaveLength(1);
+    });
+
+    it('rejects non-array config.tools as invalid_request in generate, requestBytes and submit', async () => {
+        const config = { tools: {} } as never;
+        const searching: GenaiRequest = { ...request, web_search: true };
+        const error = {
+            code: 'invalid_request' as const,
+            message: 'Invalid value for option "config.tools"',
+            retryable: false,
+        };
+        const batch = client().batch;
+        for (const entry of [request, searching]) {
+            expect(await client().generate(entry, { config })).toMatchObject({ ok: false, error });
+            expect(batch?.requestBytes(entry, config)).toEqual({ ok: false, error });
+            expect(await batch?.submit([{ key: '1', request: entry }], { config })).toEqual({ ok: false, error });
+        }
+        expect(server.received).toHaveLength(0);
+    });
+
+    it('rejects a submission above maxBytes by requestBytes before any request and accepts one at the limit', async () => {
+        const second: GenaiRequest = { ...request, messages: [{ role: 'user', content: 'snarf' }] };
+        const items = [
+            { key: 'Key-1', request },
+            { key: 'Key-2', request: second },
+        ];
+        const sizes = items.map((item) => {
+            const bytes = client().batch?.requestBytes(item.request);
+            return bytes?.ok ? bytes.data : 0;
+        });
+        const limit = (sizes[0] ?? 0) + (sizes[1] ?? 0);
+        const { maxBytes } = inlineBatchLimit;
+        try {
+            inlineBatchLimit.maxBytes = limit - 1;
+            expect(await client().batch?.submit(items)).toEqual({
+                ok: false,
+                error: {
+                    code: 'invalid_request',
+                    message: `Batch of ${limit} bytes exceeds the batch limit of ${limit - 1} bytes`,
+                    retryable: false,
+                },
+            });
+            expect(server.received).toHaveLength(0);
+            inlineBatchLimit.maxBytes = limit;
+            server.reply(() => batchResponse('batches/b1', 'BATCH_STATE_PENDING'));
+            expect(await client().batch?.submit(items)).toMatchObject({ ok: true, data: { name: 'batches/b1' } });
+            expect(server.received).toHaveLength(1);
+        } finally {
+            inlineBatchLimit.maxBytes = maxBytes;
+        }
+    });
+
     it('polls once and maps results by key; item errors by rpc code; keyless responses are skipped', async () => {
         const batch = client().batch;
         server.reply(() => batchResponse('batches/b1', 'BATCH_STATE_RUNNING'));
@@ -412,11 +525,12 @@ describe('batch on the Developer API', () => {
                 { error: { code: 13, message: 'internal' }, metadata: { key: '4' } },
                 { error: { code: 3, message: 'bad schema' }, metadata: { key: '5' } },
                 { error: { code: 8, message: 'quota' }, metadata: { key: '6' } },
+                { error: { code: 5, message: '' }, metadata: { key: '7' } },
             ]),
         );
         const done = await batch?.check('batches/b1');
         const results = done?.ok ? done.data.results : [];
-        expect(results?.map((item) => item.key)).toEqual(['2', '1', '4', '5', '6']);
+        expect(results?.map((item) => item.key)).toEqual(['2', '1', '4', '5', '6', '7']);
         expect(results?.[0]?.result).toMatchObject({
             ok: true,
             data: { json: { kind: 'verb' }, ms: 0, model: 'gemini-fake-001' },
@@ -431,6 +545,10 @@ describe('batch on the Developer API', () => {
             error: { code: 'http', status: 400, retryable: false },
         });
         expect(results?.[4]?.result).toMatchObject({ ok: false, error: { code: 'rate_limited', retryable: true } });
+        expect(results?.[5]?.result).toEqual({
+            ok: false,
+            error: { code: 'http', message: 'HTTP 404', retryable: false, status: 404 },
+        });
     });
 
     it('answers invalid_request for unknown batch options, items and names before any call', async () => {
@@ -514,6 +632,46 @@ describe('batch on the Developer API', () => {
                 },
             },
         ]);
+    });
+
+    it('reads failure reason of failed job from operation error with one extra GET', async () => {
+        server.reply(() =>
+            batchResponse('batches/b5', 'BATCH_STATE_FAILED', undefined, { code: 3, message: 'bad input' }),
+        );
+        expect(await client(`${server.baseUrl}/`).batch?.check('batches/b5')).toEqual({
+            ok: true,
+            data: { name: 'batches/b5', state: 'JOB_STATE_FAILED', phase: 'failed', error: 'bad input' },
+        });
+        expect(server.received.map((entry) => [entry.method, entry.path])).toEqual([
+            ['GET', '/v1beta/batches/b5'],
+            ['GET', '/v1beta/batches/b5'],
+        ]);
+        expect(server.received[1]?.headers.get('x-goog-api-key')).toBe(TEST_KEY);
+    });
+
+    it('keeps failed job without error when extra GET fails or is unparsable', async () => {
+        const batch = client().batch;
+        const failed = { ok: true, data: { name: 'batches/b6', state: 'JOB_STATE_FAILED', phase: 'failed' } } as const;
+        server.reply(
+            () => batchResponse('batches/b6', 'BATCH_STATE_FAILED'),
+            () => apiError(500),
+        );
+        expect(await batch?.check('batches/b6')).toEqual(failed);
+        server.reply(
+            () => batchResponse('batches/b6', 'BATCH_STATE_FAILED'),
+            () => new Response('not json'),
+        );
+        expect(await batch?.check('batches/b6')).toEqual(failed);
+        expect(server.received).toHaveLength(4);
+    });
+
+    it('sends no extra GET for succeeded and running jobs', async () => {
+        const batch = client().batch;
+        server.reply(() => batchResponse('batches/b7', 'BATCH_STATE_SUCCEEDED', []));
+        expect(await batch?.check('batches/b7')).toMatchObject({ ok: true, data: { phase: 'succeeded' } });
+        server.reply(() => batchResponse('batches/b7', 'BATCH_STATE_RUNNING'));
+        expect(await batch?.check('batches/b7')).toMatchObject({ ok: true, data: { phase: 'running' } });
+        expect(server.received).toHaveLength(2);
     });
 
     it('accepts keepFiles on check, as there are no files to remove', async () => {

@@ -6,20 +6,26 @@ import { createGenaiClient } from '../../../src/core/client.js';
 import { MAX_EMBED_INPUTS } from '../../../src/core/embed.js';
 import type { GenaiClient, GenaiEmbedRequest } from '../../../src/types.js';
 import { apiError, startFakeGemini } from '../fake-gemini.js';
-import { fakeAuthClient } from '../fake-vertex.js';
+import { fakeAuthClient, startFakeVertex } from '../fake-vertex.js';
 
 // -------------------------------------------------------------------
 // --- 1. Constants
 // -------------------------------------------------------------------
 
 const server = startFakeGemini();
+const vertexServer = startFakeVertex();
 
 afterAll(() => {
     server.stop();
+    vertexServer.stop();
 });
 beforeEach(() => {
     server.received.length = 0;
+    vertexServer.received.length = 0;
 });
+
+/** Path prefix of Google publisher models on fake Vertex AI: project `p`, location `global`. */
+const VERTEX_MODELS = '/v1beta1/projects/p/locations/global/publishers/google/models';
 
 // -------------------------------------------------------------------
 // --- 2. Private Functions
@@ -223,9 +229,20 @@ describe('embed on the Developer API', () => {
 });
 
 describe('embed on Vertex AI', () => {
-    /** Vertex AI client configured for fake server. */
+    /** Vertex AI client configured for fake Vertex server. */
     function vertex(): GenaiClient {
-        return createGenaiClient({ vertex: { project: 'p', authClient: fakeAuthClient() }, baseUrl: server.baseUrl });
+        return createGenaiClient({
+            vertex: { project: 'p', authClient: fakeAuthClient() },
+            baseUrl: vertexServer.baseUrl,
+            env: {},
+        });
+    }
+
+    /** Path and parsed body of the only call received by fake Vertex server. */
+    function sentCall(): { path: string | undefined; body: unknown } {
+        expect(vertexServer.received).toHaveLength(1);
+        const [sent] = vertexServer.received;
+        return { path: sent?.path, body: JSON.parse(sent?.body ?? 'null') };
     }
 
     it('answers unsupported for several texts to a one-content Gemini model without any call', async () => {
@@ -239,7 +256,7 @@ describe('embed on Vertex AI', () => {
                 },
             });
         }
-        expect(server.received).toHaveLength(0);
+        expect(vertexServer.received).toHaveLength(0);
     });
 
     it('answers invalid_request for different titles before unsupported', async () => {
@@ -256,16 +273,17 @@ describe('embed on Vertex AI', () => {
             ok: false,
             error: { code: 'invalid_request' },
         });
-        expect(server.received).toHaveLength(0);
+        expect(vertexServer.received).toHaveLength(0);
     });
 
     it('sends several texts to gemini-embedding-001 as predict instances, vectors in input order', async () => {
-        server.reply(() =>
-            Response.json({ predictions: [{ embeddings: { values: [1, 0] } }, { embeddings: { values: [0, 1] } }] }),
-        );
         const result = await vertex().embed({
             model: 'gemini-embedding-001',
-            input: ['first', 'second'],
+            input: [
+                { text: 'first', title: 'T' },
+                { text: 'second', title: 'T' },
+            ],
+            taskType: 'RETRIEVAL_DOCUMENT',
             dimensions: 2,
         });
         expect(result).toMatchObject({
@@ -275,13 +293,56 @@ describe('embed on Vertex AI', () => {
                     [1, 0],
                     [0, 1],
                 ],
+                model: 'gemini-embedding-001',
             },
         });
-        expect(server.received).toHaveLength(1);
-        expect(server.received[0]?.path).toEndWith('/publishers/google/models/gemini-embedding-001:predict');
-        expect(server.received[0]?.body).toEqual({
-            instances: [{ content: 'first' }, { content: 'second' }],
-            parameters: { outputDimensionality: 2 },
+        expect(sentCall()).toEqual({
+            path: `${VERTEX_MODELS}/gemini-embedding-001:predict`,
+            body: {
+                instances: [
+                    { content: 'first', task_type: 'RETRIEVAL_DOCUMENT', title: 'T' },
+                    { content: 'second', task_type: 'RETRIEVAL_DOCUMENT', title: 'T' },
+                ],
+                parameters: { outputDimensionality: 2 },
+            },
         });
+    });
+
+    it('sends several texts to publishers/google/models/gemini-embedding-001 like the unprefixed id', async () => {
+        const sent = [];
+        for (const model of ['gemini-embedding-001', 'publishers/google/models/gemini-embedding-001']) {
+            vertexServer.received.length = 0;
+            expect(await vertex().embed({ model, input: ['first', 'second'] })).toMatchObject({
+                ok: true,
+                data: {
+                    embeddings: [
+                        [1, 0],
+                        [0, 1],
+                    ],
+                    model,
+                },
+            });
+            sent.push(sentCall());
+        }
+        expect(sent[1]).toEqual(sent[0]);
+        expect(sent[0]).toEqual({
+            path: `${VERTEX_MODELS}/gemini-embedding-001:predict`,
+            body: { instances: [{ content: 'first' }, { content: 'second' }] },
+        });
+    });
+
+    it('sends one text to gemini-embedding-2 as embedContent with the task as text prefix', async () => {
+        for (const model of ['gemini-embedding-2', 'publishers/google/models/gemini-embedding-2']) {
+            vertexServer.received.length = 0;
+            const result = await vertex().embed({ model, input: 'q', taskType: 'CLUSTERING', dimensions: 3 });
+            expect(result).toMatchObject({ ok: true, data: { embeddings: [[1, 0, 0]], model } });
+            expect(sentCall()).toEqual({
+                path: `${VERTEX_MODELS}/gemini-embedding-2:embedContent`,
+                body: {
+                    content: { role: 'user', parts: [{ text: 'task: clustering | query: q' }] },
+                    embedContentConfig: { outputDimensionality: 3 },
+                },
+            });
+        }
     });
 });

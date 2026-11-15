@@ -3,6 +3,8 @@
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'bun:test';
 import { batchTiming, createBatchCalls } from '../../../src/core/batch/calls.js';
+import { finalJobError } from '../../../src/core/batch/final.js';
+import { inlineBatchLimit } from '../../../src/core/batch/inline.js';
 import { createGenaiClient } from '../../../src/core/client.js';
 import type {
     GenaiBatch,
@@ -13,7 +15,7 @@ import type {
     GenaiRequest,
     Result,
 } from '../../../src/types.js';
-import { apiError, batchResponse, generateBody, startFakeGemini } from '../fake-gemini.js';
+import { apiError, batchResponse, generateBody, sentBatch, startFakeGemini } from '../fake-gemini.js';
 import { fakeAuthClient } from '../fake-vertex.js';
 
 // -------------------------------------------------------------------
@@ -92,6 +94,9 @@ function fakeBatch(maxBytes = 1_000_000): FakeBatch {
             batch.cancels.push(name);
             return { ok: true, data: undefined };
         },
+        async list() {
+            return { ok: true, data: [] };
+        },
         async removeFiles() {
             return { ok: true, data: { removed: 0, kept: 0 } };
         },
@@ -144,6 +149,34 @@ describe('batch calls', () => {
         ]);
         expect(new Set(batch.submits.flatMap((entry) => entry.items.map((item) => item.key))).size).toBe(5);
         expect(batch.checks).toHaveLength(6);
+    });
+
+    it('collect calls into one job only when response_format and tools are equal too', async () => {
+        const batch = fakeBatch();
+        const calls = createBatchCalls(batch, 1);
+        function format(property: string): NonNullable<GenaiRequest['response_format']> {
+            return {
+                type: 'json_schema',
+                json_schema: { name: 'a', schema: { type: 'object', properties: { [property]: { type: 'string' } } } },
+            };
+        }
+        function tool(name: string): NonNullable<GenaiRequest['tools']> {
+            return [{ type: 'function', function: { name, parameters: { type: 'object' } } }];
+        }
+        await Promise.all([
+            calls.add({ ...ask('a'), response_format: format('kind') }, undefined),
+            calls.add({ ...ask('b'), response_format: format('kind') }, undefined),
+            calls.add({ ...ask('c'), response_format: format('capital') }, undefined),
+            calls.add({ ...ask('d'), tools: tool('get_weather') }, undefined),
+            calls.add({ ...ask('e'), tools: tool('get_weather') }, undefined),
+            calls.add({ ...ask('f'), tools: tool('get_time') }, undefined),
+        ]);
+        expect(batch.submits.map((entry) => entry.items.map((item) => item.request.messages[0]?.content))).toEqual([
+            ['a', 'b'],
+            ['c'],
+            ['d', 'e'],
+            ['f'],
+        ]);
     });
 
     it('split a group into several jobs when the sizes exceed maxBytes', async () => {
@@ -251,6 +284,58 @@ describe('batch calls', () => {
             { ok: false, error: gone },
         ]);
         expect(flaky.checks).toHaveLength(3);
+    });
+
+    it('cancel a job once after a fatal check error unless check found the job final', async () => {
+        const running = fakeBatch();
+        const denied: GenaiError = { code: 'http', message: 'fake 403', retryable: false, status: 403 };
+        running.status = () => ({ ok: false, error: denied });
+        const runningCalls = createBatchCalls(running, 1);
+        expect(
+            await Promise.all([runningCalls.add(ask('a'), undefined), runningCalls.add(ask('b'), undefined)]),
+        ).toEqual([
+            { ok: false, error: denied },
+            { ok: false, error: denied },
+        ]);
+        await Bun.sleep(30);
+        expect(running.cancels).toEqual(['batches/1']);
+        expect(running.checks).toHaveLength(1);
+
+        const final = fakeBatch();
+        const unread = finalJobError({ code: 'unexpected', message: 'output unreadable', retryable: false });
+        final.status = () => ({ ok: false, error: unread });
+        expect(await createBatchCalls(final, 1).add(ask('a'), undefined)).toEqual({ ok: false, error: unread });
+        await Bun.sleep(30);
+        expect(final.cancels).toEqual([]);
+    });
+
+    it('keep the settled result when the cancel after a fatal check error fails', async () => {
+        const unhandled: unknown[] = [];
+        function onUnhandled(reason: unknown): void {
+            unhandled.push(reason);
+        }
+        process.on('unhandledRejection', onUnhandled);
+        try {
+            const gone: GenaiError = { code: 'http', message: 'fake 404', retryable: false, status: 404 };
+            for (const cancel of [
+                () => Promise.reject(new Error('cancel boom')),
+                async () => ({ ok: false as const, error: gone }),
+            ]) {
+                const batch = fakeBatch();
+                batch.status = () => ({ ok: false, error: gone });
+                let cancels = 0;
+                batch.cancel = () => {
+                    cancels++;
+                    return cancel();
+                };
+                expect(await createBatchCalls(batch, 1).add(ask('a'), undefined)).toEqual({ ok: false, error: gone });
+                await Bun.sleep(30);
+                expect(cancels).toBe(1);
+            }
+            expect(unhandled).toEqual([]);
+        } finally {
+            process.off('unhandledRejection', onUnhandled);
+        }
     });
 
     it('poll again after a longer retryAfterMs of a retryable check error', async () => {
@@ -445,9 +530,7 @@ describe('batch calls of the client', () => {
         let keys: string[] = [];
         server.reply(
             (request) => {
-                keys = request.body?.batch.inputConfig.requests.requests.map(
-                    (entry: { metadata: { key: string } }) => entry.metadata.key,
-                );
+                keys = sentBatch(request).inputConfig.requests.requests.map((entry) => entry.metadata.key);
                 return batchResponse('batches/j1', 'BATCH_STATE_PENDING');
             },
             () =>
@@ -466,9 +549,43 @@ describe('batch calls of the client', () => {
         expect(second).toMatchObject({ ok: true, data: { text: 'answer 1' } });
         const [submit, check] = server.received;
         expect(submit?.path).toBe('/v1beta/models/gemini-x:batchGenerateContent');
-        expect(submit?.body?.batch.inputConfig.requests.requests).toHaveLength(2);
+        expect(sentBatch(submit).inputConfig.requests.requests).toHaveLength(2);
         expect(JSON.stringify(submit?.body)).not.toContain('"batch":true');
         expect(check?.path).toBe('/v1beta/batches/j1');
+    });
+
+    it('submit batch calls packed exactly to maxBytes as one job', async () => {
+        const sizes = [ask('a'), ask('b')].map((entry) => {
+            const bytes = client().batch?.requestBytes(entry);
+            return bytes?.ok ? bytes.data : 0;
+        });
+        const { maxBytes } = inlineBatchLimit;
+        inlineBatchLimit.maxBytes = (sizes[0] ?? 0) + (sizes[1] ?? 0);
+        try {
+            let keys: string[] = [];
+            server.reply(
+                (request) => {
+                    keys = sentBatch(request).inputConfig.requests.requests.map((entry) => entry.metadata.key);
+                    return batchResponse('batches/j1', 'BATCH_STATE_PENDING');
+                },
+                () =>
+                    batchResponse(
+                        'batches/j1',
+                        'BATCH_STATE_SUCCEEDED',
+                        keys.map((key) => ({ response: generateBody('done'), metadata: { key } })),
+                    ),
+            );
+            const studio = client();
+            const results = await Promise.all([
+                studio.generate({ ...ask('a'), batch: true }),
+                studio.generate({ ...ask('b'), batch: true }),
+            ]);
+            expect(results).toMatchObject([{ ok: true }, { ok: true }]);
+            expect(keys).toHaveLength(2);
+            expect(server.received.filter((entry) => entry.path.endsWith(':batchGenerateContent'))).toHaveLength(1);
+        } finally {
+            inlineBatchLimit.maxBytes = maxBytes;
+        }
     });
 
     it('cancel through the API and answer a submit error to every call', async () => {
@@ -486,6 +603,73 @@ describe('batch calls of the client', () => {
         server.reply(() => Response.json({}));
         expect(await studio.batch?.cancel('batches/j1')).toEqual({ ok: true, data: undefined });
         expect([server.received[0]?.method, server.received[0]?.path]).toEqual(['POST', '/v1beta/batches/j1:cancel']);
+    });
+
+    it('treat a failed cancel of a final or cancelling job as success', async () => {
+        for (const state of ['BATCH_STATE_SUCCEEDED', 'BATCH_STATE_CANCELLED', 'JOB_STATE_CANCELLING']) {
+            server.received.length = 0;
+            server.reply(
+                () => apiError(400),
+                () => batchResponse('batches/j1', state),
+            );
+            expect(await client().batch?.cancel('batches/j1')).toEqual({ ok: true, data: undefined });
+            expect(server.received.map((entry) => `${entry.method} ${entry.path}`)).toEqual([
+                'POST /v1beta/batches/j1:cancel',
+                'GET /v1beta/batches/j1',
+            ]);
+        }
+    });
+
+    it('return the cancel error when the job is still running or cannot be read', async () => {
+        for (const reread of [() => batchResponse('batches/j1', 'BATCH_STATE_RUNNING'), () => apiError(500)]) {
+            server.reply(() => apiError(400), reread);
+            expect(await client().batch?.cancel('batches/j1')).toMatchObject({
+                ok: false,
+                error: { code: 'http', status: 400 },
+            });
+        }
+    });
+
+    it('cancel a job after a fatal check error, but not a final job whose results cannot be read', async () => {
+        server.reply(
+            () => batchResponse('batches/j1', 'BATCH_STATE_PENDING'),
+            () => apiError(403),
+            () => Response.json({}),
+        );
+        expect(await client().generate({ ...ask('a'), batch: true })).toMatchObject({
+            ok: false,
+            error: { code: 'http', status: 403 },
+        });
+        await Bun.sleep(30);
+        expect(server.received.map((entry) => `${entry.method} ${entry.path}`)).toEqual([
+            'POST /v1beta/models/gemini-x:batchGenerateContent',
+            'GET /v1beta/batches/j1',
+            'POST /v1beta/batches/j1:cancel',
+        ]);
+
+        server.received.length = 0;
+        server.reply(
+            () => batchResponse('batches/j2', 'BATCH_STATE_PENDING'),
+            () =>
+                Response.json({
+                    name: 'batches/j2',
+                    metadata: {
+                        name: 'batches/j2',
+                        state: 'BATCH_STATE_SUCCEEDED',
+                        output: { responsesFile: 'files/out' },
+                    },
+                }),
+        );
+        expect(await client().generate({ ...ask('a'), batch: true })).toMatchObject({
+            ok: false,
+            error: {
+                code: 'unexpected',
+                message: 'Batch results are in the file files/out, not inline',
+                retryable: false,
+            },
+        });
+        await Bun.sleep(30);
+        expect(server.received.some((entry) => entry.path.endsWith(':cancel'))).toBe(false);
     });
 
     it('reject batch in submit items but ignore a batch default there; batch: false is a normal call', async () => {

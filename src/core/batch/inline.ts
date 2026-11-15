@@ -12,14 +12,30 @@ import type {
     Result,
 } from '../../types.js';
 import { batchPhase, guardBatch, listBatchJobs, readAnswer, rpcError, toGenaiError } from '../answer.js';
-import { batchModel, checkBatchName, checkOptionKeys, toGeminiCall, wantsJson } from '../request.js';
+import { batchModel, checkBatchBytes, checkBatchName, checkOptionKeys, toGeminiCall, wantsJson } from '../request.js';
+import { finalJobError } from './final.js';
 
 // -------------------------------------------------------------------
-// --- 1. Constants
+// --- 1. Types
 // -------------------------------------------------------------------
 
-/** Maximum payload byte budget for inline batch creation. */
-const INLINE_BATCH_MAX_BYTES = 19_000_000;
+/**
+ * **REST access for batch operations**: mirrors SDK settings of Developer API client.
+ *
+ * - `baseUrl`, `apiVersion`: same as SDK client, URL `<baseUrl>/<apiVersion>/batches/<id>`
+ * - `timeoutMs`: request timeout, same as SDK client
+ */
+export type InlineBatchRest = { apiKey: string; baseUrl: string; apiVersion: string; timeoutMs: number };
+
+// -------------------------------------------------------------------
+// --- 2. Constants
+// -------------------------------------------------------------------
+
+/**
+ * Maximum payload byte budget for inline batch creation; read when batch is created.
+ * @internal - exported for testing only
+ */
+export const inlineBatchLimit = { maxBytes: 19_000_000 };
 
 /** Metadata format flag indicating JSON parsing requested. */
 const JSON_FORMAT = 'json';
@@ -39,11 +55,14 @@ const LIST_OPTION_KEYS: ReadonlySet<string> = new Set(['signal', 'displayName'])
 /** Supported option keys for batch file removal. */
 const REMOVE_OPTION_KEYS: ReadonlySet<string> = new Set(['signal', 'keepSucceededMs']);
 
-/** Matches models/ prefix on model identifiers. */
+/** Matches `models/` prefix on model identifiers. */
 const MATCH_MODEL_PREFIX = /^models\//;
 
+/** Matches trailing slash of base URL. */
+const MATCH_TRAILING_SLASH = /\/$/;
+
 // -------------------------------------------------------------------
-// --- 2. Exported Functions
+// --- 3. Exported Functions
 // -------------------------------------------------------------------
 
 /**
@@ -52,18 +71,20 @@ const MATCH_MODEL_PREFIX = /^models\//;
  * - attaches `metadata.key` and format tracking to requests
  * - polls batch job status and parses inline responses
  * - maps individual item errors using RPC status codes
+ * - failed job: reads failure reason via REST, as SDK drops operation `error`
  */
-export function createInlineBatch(ai: GoogleGenAI): GenaiBatch {
+export function createInlineBatch(ai: GoogleGenAI, rest: InlineBatchRest): GenaiBatch {
+    const { maxBytes } = inlineBatchLimit;
     return guardBatch({
-        maxBytes: INLINE_BATCH_MAX_BYTES,
+        maxBytes,
         requestBytes(request, config) {
-            const data = new TextEncoder().encode(JSON.stringify(inlinedRequest('', request, config))).length;
-            return { ok: true, data };
+            return { ok: true, data: inlinedBytes(inlinedRequest('', request, config)) };
         },
         async submit(items, options = {}) {
             checkOptionKeys(options, SUBMIT_OPTION_KEYS);
             const model = batchModel(items);
             const src = items.map((item) => inlinedRequest(item.key, item.request, options.config));
+            checkBatchBytes(src.map(inlinedBytes), maxBytes);
             try {
                 const job = await ai.batches.create({
                     model,
@@ -90,7 +111,12 @@ export function createInlineBatch(ai: GoogleGenAI): GenaiBatch {
             const { signal } = options;
             try {
                 const job = await ai.batches.get({ name, ...(signal ? { config: { abortSignal: signal } } : {}) });
-                return readBatch({ ...job, name: job.name ?? name }, job.model ?? '');
+                const status = readBatch({ ...job, name: job.name ?? name }, job.model ?? '');
+                if (!status.ok || status.data.phase !== 'failed' || status.data.error !== undefined) {
+                    return status;
+                }
+                const error = await failureReason(rest, status.data.name, signal);
+                return error === undefined ? status : { ok: true, data: { ...status.data, error } };
             } catch (error) {
                 return { ok: false, error: toGenaiError(error, signal) };
             }
@@ -99,10 +125,13 @@ export function createInlineBatch(ai: GoogleGenAI): GenaiBatch {
             checkBatchName(name);
             checkOptionKeys(options, CANCEL_OPTION_KEYS);
             const { signal } = options;
+            const config = signal ? { config: { abortSignal: signal } } : {};
             try {
-                await ai.batches.cancel({ name, ...(signal ? { config: { abortSignal: signal } } : {}) });
+                await ai.batches.cancel({ name, ...config });
             } catch (error) {
-                return { ok: false, error: toGenaiError(error, signal) };
+                if (!(await isSettled(ai, name, config))) {
+                    return { ok: false, error: toGenaiError(error, signal) };
+                }
             }
             return { ok: true, data: undefined };
         },
@@ -119,8 +148,68 @@ export function createInlineBatch(ai: GoogleGenAI): GenaiBatch {
 }
 
 // -------------------------------------------------------------------
-// --- 3. Private Functions
+// --- 4. Private Functions
 // -------------------------------------------------------------------
+
+/**
+ * **Reads failure reason of batch operation via REST**: top-level `error.message`.
+ *
+ * - SDK `batches.get` drops operation `error` on Developer API
+ * - same URL as SDK: `<baseUrl>/<apiVersion>/batches/<id>`
+ * - any failure (network, status, body): `undefined`
+ */
+async function failureReason(
+    rest: InlineBatchRest,
+    name: string,
+    signal: AbortSignal | undefined,
+): Promise<string | undefined> {
+    const id = name.split('/').pop() ?? '';
+    const url = `${rest.baseUrl.replace(MATCH_TRAILING_SLASH, '')}/${rest.apiVersion}/batches/${encodeURIComponent(id)}`;
+    const timeout = AbortSignal.timeout(rest.timeoutMs);
+    try {
+        const response = await fetch(url, {
+            method: 'GET',
+            headers: { 'x-goog-api-key': rest.apiKey },
+            signal: signal === undefined ? timeout : AbortSignal.any([signal, timeout]),
+        });
+        if (!response.ok) {
+            return undefined;
+        }
+        const body: unknown = await response.json();
+        const message = (body as { error?: { message?: unknown } } | null)?.error?.message;
+        return typeof message === 'string' && message !== '' ? message : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+/**
+ * **Re-reads job after failed cancel**: `true` when cancel is no longer needed.
+ *
+ * - final job: API rejects cancel, nothing left to do
+ * - `JOB_STATE_CANCELLING`: cancel already under way, counts as success
+ * - re-read fails or job still running otherwise: `false`
+ */
+async function isSettled(
+    ai: GoogleGenAI,
+    name: string,
+    config: { config?: { abortSignal: AbortSignal } },
+): Promise<boolean> {
+    let job: BatchJob;
+    try {
+        job = await ai.batches.get({ name, ...config });
+    } catch {
+        return false;
+    }
+    const state = job.state ?? 'JOB_STATE_UNSPECIFIED';
+    return batchPhase(state) !== 'running' || state === 'JOB_STATE_CANCELLING';
+}
+
+/** Byte size of inlined request serialized with empty key; measure of `requestBytes` and `submit`. */
+function inlinedBytes(inlined: InlinedRequest): number {
+    const metadata = { ...inlined.metadata, key: '' };
+    return new TextEncoder().encode(JSON.stringify({ ...inlined, metadata })).length;
+}
 
 /** Formats request into InlinedRequest with metadata key and format. */
 function inlinedRequest(key: string, request: GenaiRequest, config: InlinedRequest['config']): InlinedRequest {
@@ -146,7 +235,7 @@ function readBatch(job: BatchJob, model: string): Result<GenaiBatchStatus, Genai
     }
     if (job.dest?.inlinedResponses === undefined && job.dest?.fileName !== undefined) {
         const message = `Batch results are in the file ${job.dest.fileName}, not inline`;
-        return { ok: false, error: { code: 'unexpected', message, retryable: false } };
+        return { ok: false, error: finalJobError({ code: 'unexpected', message, retryable: false }) };
     }
     const results: GenaiBatchResult[] = [];
     for (const response of job.dest?.inlinedResponses ?? []) {

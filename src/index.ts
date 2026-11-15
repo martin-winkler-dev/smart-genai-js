@@ -3,6 +3,7 @@
 
 export type { AuthClient } from 'google-auth-library';
 export { createGenaiClient, credentialsFile, GEMINI_API_KEY_ENV, VERTEX_ENV } from './core/client.js';
+export { DEFAULT_DECIDE_MODEL, MAX_DECIDE_QUESTIONS } from './core/decide.js';
 export { MAX_EMBED_INPUTS } from './core/embed.js';
 export { assistantMessage, toolMessage } from './core/messages.js';
 export { mergeGenaiConfig, validateGenaiConfig } from './core/request.js';
@@ -20,6 +21,21 @@ export type {
     GenaiClient,
     GenaiClientOptions,
     GenaiContentPart,
+    GenaiDecideAnswer,
+    GenaiDecideAnswerOf,
+    GenaiDecideChoiceAnswer,
+    GenaiDecideChoiceQuestion,
+    GenaiDecideInputPart,
+    GenaiDecideInstructions,
+    GenaiDecideMediaPart,
+    GenaiDecideNoulAnswer,
+    GenaiDecideNoulQuestion,
+    GenaiDecideOutput,
+    GenaiDecideQuestion,
+    GenaiDecideQuestions,
+    GenaiDecideRequest,
+    GenaiDecideScoreAnswer,
+    GenaiDecideScoreQuestion,
     GenaiDefaults,
     GenaiEmbedInput,
     GenaiEmbedOutput,

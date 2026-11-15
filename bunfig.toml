@@ -1,7 +1,7 @@
 [install]
 # Supply-chain protection: skip versions younger than 3 days
 minimumReleaseAge = 259200
-minimumReleaseAgeExcludes = ["smartin", "bun-test-runner", "smart-limit"]
+minimumReleaseAgeExcludes = ["smartin", "bun-test-runner"]
 
 [test]
 # test discovery skips these (node_modules is always skipped)

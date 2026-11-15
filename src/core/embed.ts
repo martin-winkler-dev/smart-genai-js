@@ -49,8 +49,16 @@ const TASK_PREFIXES: Readonly<Record<Exclude<GenaiEmbedTask, 'RETRIEVAL_DOCUMENT
     CLUSTERING: 'clustering',
 };
 
-/** Matches `gemini-embedding-2` ids (also `-preview`, with `models/` or `publishers/<name>/models/`), which take the task as text prefix. */
+/** Matches `gemini-embedding-2` ids taking task and title as text prefixes. */
 const MATCH_PREFIX_MODEL = /^(?:(?:publishers\/[^/]+\/)?models\/)?gemini-embedding-2/;
+
+/**
+ * **Google publisher prefix of Vertex AI model ids**: stripped before the SDK call.
+ *
+ * - SDK picks `predict` or `embedContent` by exact id (`gemini-embedding-001`) and adds this prefix again
+ * - `models/` and other publishers stay unchanged
+ */
+const MATCH_GOOGLE_PUBLISHER = /^publishers\/google\/models\//;
 
 // -------------------------------------------------------------------
 // --- 3. Exported Functions
@@ -60,6 +68,7 @@ const MATCH_PREFIX_MODEL = /^(?:(?:publishers\/[^/]+\/)?models\/)?gemini-embeddi
  * **`embed` of a client**: one `embedContent` SDK call (Developer API: `batchEmbedContents`) per request.
  *
  * - each input is its own `Content`, so `gemini-embedding-2` returns one vector per input instead of one fused vector
+ * - Vertex AI: multi-text input for non-`gemini-embedding-001` Gemini or `maas` models → `unsupported`
  * - invalid requests, more vectors or fewer than inputs and empty vectors never reach the caller as data
  */
 export function createEmbed(ai: GoogleGenAI, mode: GenaiClient['mode']): GenaiClient['embed'] {
@@ -68,11 +77,12 @@ export function createEmbed(ai: GoogleGenAI, mode: GenaiClient['mode']): GenaiCl
         const { signal } = options;
         const inputs = checkEmbedRequest(request);
         const model = request.model;
+        const sdkModel = mode === 'vertex' ? model.replace(MATCH_GOOGLE_PUBLISHER, '') : model;
         const { contents, config } = toEmbedCall(request, inputs);
         if (signal?.aborted) {
             return { ok: false, error: { code: 'aborted', message: 'Request aborted', retryable: false } };
         }
-        if (mode === 'vertex' && inputs.length > 1 && isSingleContentVertexModel(model)) {
+        if (mode === 'vertex' && inputs.length > 1 && isSingleContentVertexModel(sdkModel)) {
             const message = `Vertex AI embeds one text per call for ${model}; got ${inputs.length}`;
             return { ok: false, error: { code: 'unsupported', message, retryable: false } };
         }
@@ -80,7 +90,7 @@ export function createEmbed(ai: GoogleGenAI, mode: GenaiClient['mode']): GenaiCl
         let response: EmbedContentResponse;
         try {
             response = await ai.models.embedContent({
-                model,
+                model: sdkModel,
                 contents,
                 config: { ...config, ...(signal ? { abortSignal: signal } : {}) },
             });
@@ -95,14 +105,14 @@ export function createEmbed(ai: GoogleGenAI, mode: GenaiClient['mode']): GenaiCl
 // --- 4. Private Functions
 // -------------------------------------------------------------------
 
-/** Whether Vertex AI limits model to single content per call (SDK routes other Gemini/MaaS models to embedContent). */
+/** Checks if Vertex AI limits model to single content per call (other Gemini/MaaS models route to `embedContent`, `gemini-embedding-001` to `predict`). */
 function isSingleContentVertexModel(model: string): boolean {
     return (model.includes('gemini') && model !== 'gemini-embedding-001') || model.includes('maas');
 }
 
 /**
- * Inputs of a valid embedding request.
- * @throws {InvalidRequestError} If a field, an input, the task or the dimensions are invalid.
+ * Validates embedding request and normalizes inputs.
+ * @throws {InvalidRequestError} If field, input, task, or dimensions are invalid.
  */
 function checkEmbedRequest(request: GenaiEmbedRequest): EmbedText[] {
     checkOptionKeys(request, REQUEST_KEYS, 'request.');
@@ -128,8 +138,8 @@ function checkEmbedRequest(request: GenaiEmbedRequest): EmbedText[] {
 }
 
 /**
- * Input as text and title.
- * @throws {InvalidRequestError} If the input is no non-empty text or has an invalid title.
+ * Normalizes single embedding input into text and optional title.
+ * @throws {InvalidRequestError} If input is not non-empty text or has invalid title.
  */
 function toEmbedText(input: GenaiEmbedInput, index: number): EmbedText {
     const option = `input.${index}`;
@@ -180,7 +190,7 @@ function toEmbedCall(
     };
 }
 
-/** Text of an input with the `gemini-embedding-2` prefix of its task; without a task the text as it is. */
+/** Prepends `gemini-embedding-2` task/title prefix to input text when `taskType` is set. */
 function prefixedText(input: EmbedText, taskType: GenaiEmbedTask | undefined): string {
     if (taskType === undefined) {
         return input.text;
@@ -196,7 +206,7 @@ function toContent(text: string): Content {
     return { role: 'user', parts: [{ text }] };
 }
 
-/** Vectors of the response, or `unexpected` when their count differs from the inputs or one is empty. */
+/** Extracts embedding vectors; returns `unexpected` if vector count mismatches or any vector is empty. */
 function readEmbeddings(
     response: EmbedContentResponse,
     count: number,

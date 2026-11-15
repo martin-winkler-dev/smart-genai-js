@@ -68,10 +68,15 @@ const THINKING_BUDGETS: Readonly<Record<GenaiReasoningEffort, number>> = {
     max: 24_576,
 };
 
-/** Thinking levels for newer Gemini models by reasoning effort. */
+/**
+ * **Thinking levels for newer Gemini models by reasoning effort**.
+ *
+ * - `none`/`minimal`: `LOW`, accepted wherever thinking levels exist
+ * - `MINIMAL` instead only on models matching `MATCH_MINIMAL_LEVEL`
+ */
 const THINKING_LEVELS: Readonly<Record<GenaiReasoningEffort, ThinkingLevel>> = {
-    none: ThinkingLevel.MINIMAL,
-    minimal: ThinkingLevel.MINIMAL,
+    none: ThinkingLevel.LOW,
+    minimal: ThinkingLevel.LOW,
     low: ThinkingLevel.LOW,
     medium: ThinkingLevel.MEDIUM,
     high: ThinkingLevel.HIGH,
@@ -79,8 +84,47 @@ const THINKING_LEVELS: Readonly<Record<GenaiReasoningEffort, ThinkingLevel>> = {
     max: ThinkingLevel.HIGH,
 };
 
+/** Thinking levels for Gemma models by reasoning effort: only `MINIMAL` and `HIGH` exist there. */
+const GEMMA_THINKING_LEVELS: Readonly<Record<GenaiReasoningEffort, ThinkingLevel>> = {
+    none: ThinkingLevel.MINIMAL,
+    minimal: ThinkingLevel.MINIMAL,
+    low: ThinkingLevel.MINIMAL,
+    medium: ThinkingLevel.HIGH,
+    high: ThinkingLevel.HIGH,
+    xhigh: ThinkingLevel.HIGH,
+    max: ThinkingLevel.HIGH,
+};
+
 /** Matches Gemini 2.x model identifiers using token-based thinking budget. */
 const MATCH_GEMINI_2 = /^(?:(?:publishers\/[^/]+\/)?models\/)?gemini-2\./;
+
+/**
+ * **Matches models known not to use thought signatures**: no `skip_thought_signature_validator` placeholder for them.
+ *
+ * - `publishers/<name>/models/` with `<name>` other than `google`: non-Gemini publisher model
+ * - otherwise optional `models/` or `publishers/google/models/` prefix, then `gemini-1.` or `gemini-2.`
+ * - other ids keep the placeholder (Gemini 3+, aliases like `gemini-flash-latest`, tuned models, endpoints, unknown ids)
+ */
+const MATCH_NO_SIGNATURE =
+    /^(?:publishers\/(?!google\/)[^/]+\/models\/|(?:(?:publishers\/google\/)?models\/)?gemini-[12]\.)/;
+
+/**
+ * **Matches models accepting thinking level `MINIMAL`**: Gemini 3.0 to 3.6 Flash and Flash-Lite.
+ *
+ * - optional resource prefix as in `MATCH_GEMINI_2`
+ * - `gemini-3`, then optional minor `.0` to `.6`, then `-flash` or `-flash-lite`
+ * - then end of id or `-` suffix (e.g. `-preview`)
+ * - other models (Pro, Gemini 3.7+, Gemini 4, unknown ids) reject `MINIMAL` with HTTP 400
+ */
+const MATCH_MINIMAL_LEVEL = /^(?:(?:publishers\/[^/]+\/)?models\/)?gemini-3(?:\.[0-6])?-flash(?:-lite)?(?:-|$)/;
+
+/**
+ * **Matches Gemma models**: optional resource prefix as in `MATCH_GEMINI_2`, then `gemma-`.
+ *
+ * - live (Gemma 4, Developer API): thinking levels `MINIMAL` and `HIGH` accepted
+ * - `LOW`, `MEDIUM` and any `thinkingBudget` rejected with HTTP 400
+ */
+const MATCH_GEMMA = /^(?:(?:publishers\/[^/]+\/)?models\/)?gemma-/;
 
 /** Matches Gemini 2.5 Pro model identifiers requiring minimum thinking budget. */
 const MATCH_GEMINI_25_PRO = /^(?:(?:publishers\/[^/]+\/)?models\/)?gemini-2\.5-pro/;
@@ -113,8 +157,15 @@ const TOOL_CHOICE_MODES: Readonly<Record<string, FunctionCallingConfigMode>> = {
 /** Fallback thought signature used when caller omits initial signature. */
 const SKIP_SIGNATURE = 'skip_thought_signature_validator';
 
-/** Matches base64 data URLs for image parts. */
-const MATCH_IMAGE_DATA_URL = /^data:(image\/[\w.+-]+);base64,([A-Za-z0-9+/]*={0,2})$/;
+/** Matches base64 data URLs for image parts; payload must not be empty. */
+export const MATCH_IMAGE_DATA_URL = /^data:(image\/[\w.+-]+);base64,([A-Za-z0-9+/]+={0,2})$/;
+
+/** Range of int32 values accepted for `seed`. */
+const INT32_MIN = -(2 ** 31);
+const INT32_MAX = 2 ** 31 - 1;
+
+/** Maximum number of `stop` sequences accepted by the API. */
+const MAX_STOP_SEQUENCES = 5;
 
 /** Supported response format types. */
 const FORMAT_TYPES: ReadonlySet<string> = new Set(['text', 'json_object', 'json_schema']);
@@ -141,7 +192,10 @@ const NUMBER_FIELDS: readonly [field: keyof GenaiRequest, target: keyof Generate
  * - joins `system` and `developer` messages into `systemInstruction`
  * - maps `response_format` to `responseMimeType` and `responseJsonSchema`
  * - maps `reasoning_effort` to `thinkingConfig` with `includeThoughts: true`
+ * - `config` with `thinkingBudget` or `thinkingLevel` wins over the one from `reasoning_effort`; `includeThoughts` kept
  * - maps `tools` and `tool_choice` to Gemini function declarations and config
+ * - `tool_choice` applied with function declarations in `tools` or `config.tools`; dropped without any
+ * - named `tool_choice` must match one of these declarations; `config.toolConfig` wins per field
  * - maps `assistant` tool calls and `tool` responses to Gemini turns
  * - merges call `config` last
  * @throws {InvalidRequestError} If request format or options are invalid.
@@ -162,7 +216,7 @@ export function toGeminiCall(request: GenaiRequest, config: GenerateContentConfi
             for (const call of message.tool_calls ?? []) {
                 callNames.set(call.id, call.function.name);
             }
-            contents.push({ role: 'model', parts: modelParts(message, !MATCH_GEMINI_2.test(model)) });
+            contents.push({ role: 'model', parts: modelParts(message, !MATCH_NO_SIGNATURE.test(model)) });
         } else if (message.role === 'tool') {
             const part: Part = {
                 functionResponse: {
@@ -198,7 +252,8 @@ export function toGeminiCall(request: GenaiRequest, config: GenerateContentConfi
     if (request.stop !== undefined) {
         built.stopSequences = typeof request.stop === 'string' ? [request.stop] : request.stop;
     }
-    const thinking = toThinkingConfig(request.reasoning_effort, model);
+    const derived = toThinkingConfig(request.reasoning_effort, model);
+    const thinking = setsThinking(undefined, config) ? withoutBudgetOrLevel(derived) : derived;
     if (thinking !== undefined) {
         built.thinkingConfig = thinking;
     }
@@ -215,11 +270,22 @@ export function toGeminiCall(request: GenaiRequest, config: GenerateContentConfi
     if (added.length > 0) {
         merged.tools = [...(config?.tools ?? []), ...added];
     }
-    if (declarations !== undefined && request.tool_choice !== undefined) {
+    const choice = request.tool_choice;
+    const configNames = configFunctionNames(config);
+    if (choice !== undefined && (declarations !== undefined || configNames.length > 0)) {
+        if (
+            typeof choice !== 'string' &&
+            !configNames.includes(choice.function.name) &&
+            !declarations?.some((declaration) => declaration.name === choice.function.name)
+        ) {
+            throw new InvalidRequestError(
+                'Invalid value for option "tool_choice.function.name": the name of one of "tools"',
+            );
+        }
         const toolConfig: ToolConfig = config?.toolConfig ?? {};
         merged.toolConfig = {
             ...toolConfig,
-            functionCallingConfig: { ...toFunctionCalling(request.tool_choice), ...toolConfig.functionCallingConfig },
+            functionCallingConfig: { ...toFunctionCalling(choice), ...toolConfig.functionCallingConfig },
         };
     }
     return { model, contents, config: merged };
@@ -230,9 +296,11 @@ export function toGeminiCall(request: GenaiRequest, config: GenerateContentConfi
  *
  * - fills unset request fields from `defaults`
  * - request `max_tokens` or `max_completion_tokens` replaces both defaults
+ * - `reasoning_effort`, `thinkingBudget` and `thinkingLevel` count as one setting; call sets one → all three dropped from defaults
+ * - default `includeThoughts` kept; dropped default `reasoning_effort` implies no `includeThoughts: true`
  * - merges `config` with call `config`
  * - checks request keys before the merge, which drops `undefined` values
- * @throws {InvalidRequestError} If the request or `config` contains unsupported fields.
+ * @throws {InvalidRequestError} If request or `config` has unsupported fields.
  */
 export function applyDefaults(
     defaults: GenaiDefaults | undefined,
@@ -249,14 +317,48 @@ export function applyDefaults(
     if (config !== undefined) {
         validateGenaiConfig(config, 'config');
     }
-    const { config: defaultConfig, ...defaultFields } = defaults;
+    const { config: givenConfig, ...defaultFields } = defaults;
+    let defaultConfig = givenConfig;
     if (request.max_tokens !== undefined || request.max_completion_tokens !== undefined) {
         delete defaultFields.max_tokens;
         delete defaultFields.max_completion_tokens;
     }
+    if (setsThinking(request, config)) {
+        delete defaultFields.reasoning_effort;
+        defaultConfig = withoutThinkingSetting(defaultConfig);
+    }
     return {
         request: assignDefined({ ...defaultFields }, request) as GenaiRequest,
         config: mergeGenaiConfig(defaultConfig, config),
+    };
+}
+
+/**
+ * **Applies request defaults to batch items and job config**.
+ *
+ * - job config: `defaults.config` merged with `config` as in `applyDefaults`
+ * - items: unset fields filled as in `applyDefaults`; `config` with budget or level → no default `reasoning_effort`
+ * - job config is shared, so it cannot drop a default budget or level for single items
+ * @throws {InvalidRequestError} If item or `config` has unsupported fields, or item `reasoning_effort` meets default `thinkingBudget`/`thinkingLevel`.
+ */
+export function applyBatchDefaults<T extends { key: string; request: GenaiRequest }>(
+    defaults: GenaiDefaults,
+    items: readonly T[],
+    config: GenerateContentConfig | undefined,
+): { items: T[]; config: GenerateContentConfig | undefined } {
+    const merged = applyDefaults(defaults, { messages: [] }, config).config;
+    const isDefaultThinking = !setsThinking(undefined, config) && setsThinking(undefined, defaults.config);
+    return {
+        items: items.map((item) => {
+            const request = item?.request;
+            if (isDefaultThinking && isPlainObject(request) && request.reasoning_effort !== undefined) {
+                throw new InvalidRequestError(
+                    `Option "reasoning_effort" of item "${item.key}" is not supported together with "defaults.config.thinkingConfig.thinkingBudget" or "thinkingLevel"`,
+                );
+            }
+            return { ...item, request: applyDefaults(defaults, request, config).request } as T;
+        }),
+        config: merged,
     };
 }
 
@@ -280,7 +382,7 @@ export function mergeGenaiConfig(...configs: (GenerateContentConfig | undefined)
 
 /**
  * Validates Gemini config options.
- * @throws {InvalidRequestError} If config has `__proto__` key or SDK-only properties (`abortSignal`, `httpOptions`, `automaticContinuation`).
+ * @throws {InvalidRequestError} If config is not plain object, has `__proto__`, SDK-only keys, or invalid `tools`.
  */
 export function validateGenaiConfig(config: unknown, option: string): void {
     if (!isPlainObject(config) || Object.hasOwn(config, '__proto__')) {
@@ -290,6 +392,9 @@ export function validateGenaiConfig(config: unknown, option: string): void {
         if (SDK_CONFIG_KEYS.has(key)) {
             throw new InvalidRequestError(`Option "${option}.${key}" is not supported`);
         }
+    }
+    if (config.tools != null && !Array.isArray(config.tools)) {
+        throw new InvalidRequestError(`Invalid value for option "${option}.tools"`);
     }
 }
 
@@ -325,7 +430,7 @@ export function batchModel(items: readonly { key: string; request: GenaiRequest 
         }
         keys.add(item.key);
         validateRequest(item.request);
-        if ('batch' in item.request) {
+        if (item.request.batch !== undefined) {
             throw new InvalidRequestError('Option "batch" is not supported in batch items');
         }
     }
@@ -337,8 +442,22 @@ export function batchModel(items: readonly { key: string; request: GenaiRequest 
 }
 
 /**
- * Validates option object keys against an allowed set.
- * @throws {InvalidRequestError} If options is not a plain object or contains disallowed keys.
+ * **Checks size of batch submission against `maxBytes`**: same measure as batch call chunker.
+ *
+ * - `sizes`: `requestBytes` of each item (line measured with empty key)
+ * - real line keys not counted: chunk packed to `maxBytes` by batch calls always passes
+ * @throws {InvalidRequestError} If sum of `sizes` exceeds `maxBytes`.
+ */
+export function checkBatchBytes(sizes: readonly number[], maxBytes: number): void {
+    const bytes = sizes.reduce((sum, size) => sum + size, 0);
+    if (bytes > maxBytes) {
+        throw new InvalidRequestError(`Batch of ${bytes} bytes exceeds the batch limit of ${maxBytes} bytes`);
+    }
+}
+
+/**
+ * Validates option keys against allowed set and checks common option values (`signal`, `displayName`, `keepFiles`, `keepSucceededMs`).
+ * @throws {InvalidRequestError} If options is not plain object, has disallowed keys, or has invalid common option values.
  */
 export function checkOptionKeys(options: unknown, allowed: ReadonlySet<string>, prefix = ''): void {
     if (typeof options !== 'object' || options === null || Array.isArray(options)) {
@@ -416,10 +535,10 @@ export function toSettings(
     }
     if (request.tools !== undefined) {
         settings.tools = request.tools.map((tool) => tool.function.name);
-        // Only with tools, since it is sent only with them.
-        if (request.tool_choice !== undefined) {
-            settings.tool_choice = copyPlain(request.tool_choice);
-        }
+    }
+    // Only with function tools, since it is sent only with them.
+    if (request.tool_choice !== undefined && (request.tools !== undefined || configFunctionNames(config).length > 0)) {
+        settings.tool_choice = copyPlain(request.tool_choice);
     }
     if (config !== undefined && Object.keys(config).length > 0) {
         settings.config = copyPlain(config);
@@ -446,8 +565,8 @@ export function copyPlain<T>(value: T): T {
 // -------------------------------------------------------------------
 
 /**
- * Checks that the request has only supported keys.
- * @throws {InvalidRequestError} If a key is not supported.
+ * Validates that request has only supported keys.
+ * @throws {InvalidRequestError} If key is not supported.
  */
 function checkRequestKeys(request: GenaiRequest): void {
     for (const key of Object.keys(request)) {
@@ -515,13 +634,19 @@ function validateRequest(request: GenaiRequest): void {
     if (request.max_tokens !== undefined && request.max_completion_tokens !== undefined) {
         throw new InvalidRequestError('Option "max_tokens" is not supported together with "max_completion_tokens"');
     }
-    const { stop } = request;
+    const { seed, stop } = request;
+    if (seed !== undefined && (!Number.isInteger(seed) || seed < INT32_MIN || seed > INT32_MAX)) {
+        throw new InvalidRequestError('Invalid value for option "seed": an int32 integer');
+    }
     if (
         stop !== undefined &&
         typeof stop !== 'string' &&
         !(Array.isArray(stop) && stop.every((entry) => typeof entry === 'string'))
     ) {
         throw new InvalidRequestError('Invalid value for option "stop"');
+    }
+    if (Array.isArray(stop) && stop.length > MAX_STOP_SEQUENCES) {
+        throw new InvalidRequestError(`Invalid value for option "stop": up to ${MAX_STOP_SEQUENCES} sequences`);
     }
 }
 
@@ -658,7 +783,8 @@ function validateTools(request: GenaiRequest): void {
     }
     checkMembers(named.function, new Set(['name']), 'tool_choice.function');
     const { name } = named.function;
-    if (typeof name !== 'string' || (tools !== undefined && !names.has(name))) {
+    // Membership in the declared names is checked in `toGeminiCall`, which also sees `config.tools`.
+    if (typeof name !== 'string') {
         throw new InvalidRequestError(
             'Invalid value for option "tool_choice.function.name": the name of one of "tools"',
         );
@@ -724,13 +850,46 @@ function modelParts(message: Extract<GenaiMessage, { role: 'assistant' }>, skipS
     return parts;
 }
 
+/** Checks whether request or config sets `reasoning_effort`, `thinkingBudget` or `thinkingLevel`. */
+function setsThinking(request: GenaiRequest | undefined, config: GenerateContentConfig | undefined): boolean {
+    const thinking = config?.thinkingConfig;
+    return (
+        request?.reasoning_effort !== undefined ||
+        thinking?.thinkingBudget !== undefined ||
+        thinking?.thinkingLevel !== undefined
+    );
+}
+
+/** Copies thinking config without `thinkingBudget` and `thinkingLevel`; `undefined` if nothing remains. */
+function withoutBudgetOrLevel(thinking: ThinkingConfig | undefined): ThinkingConfig | undefined {
+    if (!isPlainObject(thinking)) {
+        return thinking;
+    }
+    const { thinkingBudget: _budget, thinkingLevel: _level, ...rest } = thinking;
+    return Object.keys(rest).length === 0 ? undefined : rest;
+}
+
+/** Copies config without `thinkingBudget` and `thinkingLevel`; drops `thinkingConfig` if nothing remains. */
+function withoutThinkingSetting(config: GenerateContentConfig | undefined): GenerateContentConfig | undefined {
+    if (config?.thinkingConfig === undefined) {
+        return config;
+    }
+    const { thinkingConfig, ...rest } = config;
+    const thinking = withoutBudgetOrLevel(thinkingConfig);
+    return thinking === undefined ? rest : { ...rest, thinkingConfig: thinking };
+}
+
 /** Maps reasoning effort to Gemini thinkingConfig based on model capabilities. */
 function toThinkingConfig(effort: GenaiReasoningEffort | undefined, model: string): ThinkingConfig | undefined {
     if (effort === undefined) {
         return undefined;
     }
+    if (MATCH_GEMMA.test(model)) {
+        return { thinkingLevel: GEMMA_THINKING_LEVELS[effort], includeThoughts: true };
+    }
     if (!MATCH_GEMINI_2.test(model)) {
-        return { thinkingLevel: THINKING_LEVELS[effort], includeThoughts: true };
+        const lowest = (effort === 'none' || effort === 'minimal') && MATCH_MINIMAL_LEVEL.test(model);
+        return { thinkingLevel: lowest ? ThinkingLevel.MINIMAL : THINKING_LEVELS[effort], includeThoughts: true };
     }
     const thinkingBudget =
         effort === 'none' && MATCH_GEMINI_25_PRO.test(model) ? GEMINI_25_PRO_MIN_BUDGET : THINKING_BUDGETS[effort];
@@ -745,9 +904,26 @@ function toFunctionResponse(text: string): Record<string, unknown> {
             return value;
         }
     } catch {
-        // plain text result
+        // Not JSON object: fall back to { output: text }
     }
     return { output: text };
+}
+
+/** Names of function declarations in `config.tools`; skips entries without `functionDeclarations`. */
+function configFunctionNames(config: GenerateContentConfig | undefined): string[] {
+    const tools: unknown = config?.tools;
+    if (!Array.isArray(tools)) {
+        return [];
+    }
+    return tools.flatMap((tool: unknown) => {
+        const declarations = (tool as { functionDeclarations?: unknown } | null)?.functionDeclarations;
+        return Array.isArray(declarations)
+            ? declarations.flatMap((declaration: unknown) => {
+                  const name = (declaration as { name?: unknown } | null)?.name;
+                  return typeof name === 'string' ? [name] : [];
+              })
+            : [];
+    });
 }
 
 /** Maps tool_choice to Gemini functionCallingConfig. */

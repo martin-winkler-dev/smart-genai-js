@@ -16,9 +16,10 @@ export type Result<T, E> = { ok: true; data: T } | { ok: false; error: E };
  * **Options for `createGenaiClient`**.
  *
  * - without `vertex`: Gemini Developer API (AI Studio); `apiKey` defaults to `GEMINI_API_KEY`
- * - `vertex`: Vertex AI with credentials file; `true` reads configuration from environment
+ * - `vertex`: Vertex AI config or `true` to read from env
  * - `env`: source for defaults (default `process.env`); never reads `.env` files directly
  * - `timeoutMs`: HTTP timeout per call (default 120 s)
+ * - `baseUrl`: custom API endpoint URL
  * - `defaults`: request defaults and Gemini config (see `GenaiDefaults`)
  * - `batchWaitSec`: collection window for batch calls in seconds (default 10, range 1–600)
  */
@@ -38,16 +39,17 @@ export type GenaiClientOptions = {
  * - request fields override defaults
  * - `max_tokens` and `max_completion_tokens` count as one field; either replaces both defaults
  * - `config` merges with call `config` per field; `thinkingConfig` merges per member
+ * - `reasoning_effort`, `thinkingBudget` and `thinkingLevel` count as one setting; call sets one → all three replaced
  */
 export type GenaiDefaults = Omit<GenaiRequest, 'messages'> & { config?: GenerateContentConfig };
 
 /**
- * **Vertex AI configuration**: all values fall back to environment variables.
+ * **Vertex AI configuration**: `project`, `location`, `bucket`, and `credentialsFile` fall back to env vars.
  *
  * - `project`: Google Cloud project ID (env `GOOGLE_CLOUD_PROJECT`)
  * - `location`: region (env `GOOGLE_CLOUD_LOCATION`, default `global`)
  * - `bucket`: Cloud Storage bucket for batch files (env `VERTEX_BATCH_BUCKET`)
- * - `credentialsFile`: service account or ADC JSON file (env `GOOGLE_APPLICATION_CREDENTIALS`)
+ * - `credentialsFile`: service account or ADC JSON file (env `GOOGLE_APPLICATION_CREDENTIALS`, else gcloud ADC)
  * - `authClient`: custom AuthClient instance
  * - `storageUrl`: custom Cloud Storage endpoint URL
  */
@@ -107,6 +109,7 @@ export type GenaiMessage =
  *
  * - `name`: 1–128 characters (`[A-Za-z0-9_.:-]`)
  * - `parameters`: JSON Schema for function arguments (sent as `parametersJsonSchema`)
+ * - `parameters` on Vertex batch: sent as typed `parameters`; other keywords → `invalid_request` at `requestBytes`/`submit`
  * - `strict`: accepted for OpenAI compatibility, not sent to Gemini
  */
 export type GenaiTool = {
@@ -136,6 +139,8 @@ export type GenaiToolCall = {
  * **Response format specification**.
  *
  * - `json_schema`: JSON constrained by `schema` (sent as `responseJsonSchema`)
+ * - `json_schema` on Vertex batch: `required` lists not sent, fields may be missing; validate parsed answer
+ * - `json_schema` on Vertex batch: sent as typed `responseSchema`; other keywords → `invalid_request` at `requestBytes`/`submit`
  * - `json_object`: unconstrained JSON output (`responseMimeType: application/json`)
  * - `text`: plain text output
  */
@@ -161,7 +166,7 @@ export type GenaiResponseFormat =
  * - `reasoning_effort`: thinking level or budget
  * - `web_search`: enables Google Search grounding
  * - `tools` / `tool_choice`: function calling configuration
- * - `batch`: routes call through Batch API
+ * - `batch`: routes call through Batch API; shares job only with calls of equal model, config, `response_format`, `tools`
  */
 export type GenaiRequest = {
     model?: string;
@@ -191,8 +196,10 @@ export type GenaiRequest = {
  * **Thinking configuration level**.
  *
  * - Gemini 2.x: sets `thinkingBudget` (0, 512, 1024, 8192, 24576; Gemini 2.5 Pro minimum 128)
- * - other models: sets `thinkingLevel` (`MINIMAL`, `LOW`, `MEDIUM`, `HIGH`)
- * - enables `includeThoughts: true` (reasoning output returned in `reasoning`)
+ * - other models: sets `thinkingLevel` (`LOW`, `MEDIUM`, `HIGH`)
+ * - `none`/`minimal`: `LOW`; `MINIMAL` only on Gemini 3.0 to 3.6 Flash and Flash-Lite
+ * - Gemma: `none`/`minimal`/`low`: `MINIMAL`; others: `HIGH` (only levels supported there)
+ * - enables `includeThoughts: true` when thinking active (reasoning output returned in `reasoning`)
  */
 export type GenaiReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
@@ -358,6 +365,8 @@ export type GenaiBatchJob = {
  * - `maxBytes`: size limit for single batch submission
  * - `requestBytes`: calculates encoded byte size of request
  * - `submit`: creates batch job for multiple items sharing one model
+ * - Vertex AI: job mixes property names of different schemas; removed from answers and tool call arguments, but model
+ *   still sees them and spends tokens: one job per schema gives cleanest answers
  * - `check`: checks job status and downloads completed results; final job's bucket files removed unless `keepFiles`
  * - `cancel`: cancels active batch job; on Vertex AI also removes its bucket files, also of final job
  * - `list`: lists batch jobs without changing anything, e.g. to find job whose name was lost
@@ -383,6 +392,7 @@ export type GenaiBatch = {
      * **Removes orphaned batch folders from Cloud Storage**.
      *
      * - deletes `smart-genai/<id>/` folders not associated with running jobs
+     * - only own folders (`<project>_<location>_` prefix) and legacy plain UUID folders; others never touched
      * - keeps folders of succeeded jobs within `keepSucceededMs` after job end (unknown end: kept)
      * - preserves folders with recent uploads (grace period)
      * - non-applicable for Developer API (returns `unsupported`)
@@ -395,6 +405,7 @@ export type GenaiBatch = {
  *
  * - `generate`: executes single request or batch call (`batch: true`)
  * - `embed`: one vector per input text from one API call (`GenaiEmbedRequest`)
+ * - `decide`: evaluates typed questions over one input (`GenaiDecideRequest`, default `gemini-decision-1`); Developer API only
  * - `listModels`: retrieves available models
  * - `batch`: batch API interface
  */
@@ -406,6 +417,10 @@ export type GenaiClient = {
         request: GenaiEmbedRequest,
         options?: { signal?: AbortSignal },
     ): Promise<Result<GenaiEmbedOutput, GenaiError>>;
+    decide<const Q extends GenaiDecideQuestions>(
+        request: GenaiDecideRequest<Q>,
+        options?: { signal?: AbortSignal },
+    ): Promise<Result<GenaiDecideOutput<Q>, GenaiError>>;
     listModels(options?: { signal?: AbortSignal }): Promise<Result<GenaiModelInfo[], GenaiError>>;
 };
 
@@ -426,7 +441,7 @@ export type GenaiEmbedTask =
     | 'CLASSIFICATION'
     | 'CLUSTERING';
 
-/** Text to embed; `title` (e.g. the section heading) only with task `RETRIEVAL_DOCUMENT`. */
+/** Text to embed; `title` (e.g. section heading) only with `RETRIEVAL_DOCUMENT`. */
 export type GenaiEmbedInput = string | { text: string; title?: string };
 
 /**
@@ -449,13 +464,134 @@ export type GenaiEmbedRequest = {
 /** Vectors of an embedding request, in input order. */
 export type GenaiEmbedOutput = { embeddings: number[][]; model: string; ms: number };
 
-/** Information about available Gemini model. */
+/** Decision question instructions: text, text part, or text part list. */
+export type GenaiDecideInstructions = string | GenaiTextPart | readonly GenaiTextPart[];
+
+/** Yes/no question (`noul`); `criteria` optionally describes what counts as true and as false. */
+export type GenaiDecideNoulQuestion = {
+    type: 'noul';
+    instructions: GenaiDecideInstructions;
+    criteria?: {
+        // biome-ignore lint/style/useNamingConvention: Decisions API field name
+        true_description?: string;
+        // biome-ignore lint/style/useNamingConvention: Decisions API field name
+        false_description?: string;
+    };
+};
+
+/** Single-select question: `criteria` maps 2 to 255 option ids to descriptions (`''` allowed). */
+export type GenaiDecideChoiceQuestion = {
+    type: 'choice';
+    instructions: GenaiDecideInstructions;
+    criteria: Readonly<Record<string, string>>;
+};
+
+/** Ordinal question: `criteria` lists 2 to 255 levels, lowest first. */
+export type GenaiDecideScoreQuestion = {
+    type: 'score';
+    instructions: GenaiDecideInstructions;
+    criteria: readonly string[];
+};
+
+/** Decision question of one kind: `noul`, `choice` or `score`. */
+export type GenaiDecideQuestion = GenaiDecideNoulQuestion | GenaiDecideChoiceQuestion | GenaiDecideScoreQuestion;
+
+/** Questions of a decision request by key (`[A-Za-z0-9_-]`, 1 to 64 characters). */
+export type GenaiDecideQuestions = Readonly<Record<string, GenaiDecideQuestion>>;
+
+/**
+ * **Media block of decision input in Decisions API form**: sent as given.
+ *
+ * - `data` (base64) or `uri`, exactly one
+ * - `document`: PDF, CSV and Office/OpenDocument types; API checks the type
+ * - `resolution`: only `image` and `video`; `ultra_high` only `image`
+ */
+export type GenaiDecideMediaPart = ({ data: string; uri?: never } | { uri: string; data?: never }) & {
+    // biome-ignore lint/style/useNamingConvention: Decisions API field name
+    mime_type: string;
+} & (
+        | { type: 'image'; resolution?: 'low' | 'medium' | 'high' | 'ultra_high' }
+        | { type: 'video'; resolution?: 'low' | 'medium' | 'high' }
+        | { type: 'audio' | 'document'; resolution?: never }
+    );
+
+/** Part of decision input: text, image as base64 data URL (chat form), or media block. */
+export type GenaiDecideInputPart = GenaiContentPart | GenaiDecideMediaPart;
+
+/**
+ * **Decision request**: all questions evaluated over one shared input in one API call.
+ *
+ * - `model`: default `gemini-decision-1`; `models/` prefix accepted
+ * - `input`: non-empty text or 1+ parts
+ * - `questions`: 1 to 1000 questions by key
+ */
+export type GenaiDecideRequest<Q extends GenaiDecideQuestions = GenaiDecideQuestions> = {
+    model?: string;
+    input: string | readonly GenaiDecideInputPart[];
+    questions: Q;
+};
+
+/** Answer to a `noul` question: `noul` is the probability of true (0.01 to 0.99). */
+export type GenaiDecideNoulAnswer = { type: 'noul'; noul: number; confidence: number };
+
+/** Answer to a `choice` question: most probable option and probabilities of all options (sum 1). */
+export type GenaiDecideChoiceAnswer<C extends string = string> = {
+    type: 'choice';
+    choice: C;
+    probabilities: Record<C, number>;
+    confidence: number;
+};
+
+/**
+ * **Answer to a `score` question**.
+ *
+ * - `score`: probability-weighted level index (e.g. `2.75`)
+ * - `probabilities`, `legend`: keyed by level index as string (`'0'`, `'1'`, …); `legend` maps index to level text
+ */
+export type GenaiDecideScoreAnswer = {
+    type: 'score';
+    score: number;
+    probabilities: Record<string, number>;
+    legend: Record<string, string>;
+    confidence: number;
+};
+
+/** Answer of any kind. */
+export type GenaiDecideAnswer = GenaiDecideNoulAnswer | GenaiDecideChoiceAnswer | GenaiDecideScoreAnswer;
+
+/** Answer type of question; choice answers typed by option ids (numeric keys as strings). */
+export type GenaiDecideAnswerOf<T extends GenaiDecideQuestion> = T extends { type: 'noul' }
+    ? GenaiDecideNoulAnswer
+    : T extends { type: 'choice'; criteria: infer C }
+      ? GenaiDecideChoiceAnswer<`${Extract<keyof C, string | number>}`>
+      : GenaiDecideScoreAnswer;
+
+/**
+ * **Output of a decision request**.
+ *
+ * - `answers`: one answer per question key
+ * - `usage`: `total_input_tokens` and `total_output_tokens` (always 0) of the response
+ */
+export type GenaiDecideOutput<Q extends GenaiDecideQuestions = GenaiDecideQuestions> = {
+    answers: { -readonly [K in keyof Q]: GenaiDecideAnswerOf<Q[K]> };
+    usage: { inputTokens: number | null; outputTokens: number | null };
+    model: string;
+    ms: number;
+};
+
+/**
+ * **Information about available Gemini model**: fields as reported by the API.
+ *
+ * - Developer API: all fields set where the API reports them
+ * - Vertex AI: publisher models report only `id`; `actions` is `[]`, all other fields absent
+ */
 export type GenaiModelInfo = {
     id: string;
     displayName?: string;
     description?: string;
     inputTokenLimit?: number;
     outputTokenLimit?: number;
+    /** Supported actions such as `generateContent`; always `[]` on Vertex AI. */
     actions: string[];
     thinking?: boolean;
 };
@@ -463,7 +599,7 @@ export type GenaiModelInfo = {
 /**
  * **Rate limiting rules**: configured via smart-limit buckets.
  *
- * - `concurrency`: maximum concurrent requests in flight
+ * - `concurrency`: maximum concurrent synchronous requests in flight; batch calls (`batch: true`) not capped
  * - `rps` / `rpm` / `rpd`: request counts per second, minute, or day
  * - `tpm` / `tpd`: token limits per minute or day
  * - `intervalMs`: minimum delay between consecutive request starts
@@ -485,6 +621,7 @@ export type GenaiLimiterOptions = {
     maxRetries?: number;
     retryDelayMs?: number;
     maxRetryDelayMs?: number;
+    /** Maximum wait per model queue for capacity, locks, or retries; `Infinity` for no wait limit. */
     maxWaitMs?: number;
 };
 
@@ -519,7 +656,7 @@ export type GenaiModelOptions = {
 /**
  * **Named model caller function**.
  *
- * - accepts string prompt or message array, plus per-call options
+ * - accepts string, content parts, or message array, plus per-call options
  * - routes calls through configured limiter queues
  * - provides `id` property and optional `batch` interface
  */

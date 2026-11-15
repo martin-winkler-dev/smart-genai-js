@@ -21,6 +21,7 @@ import {
 import { guard, guardBatch } from '../core/answer.js';
 import { createGenaiClient } from '../core/client.js';
 import {
+    applyBatchDefaults,
     applyDefaults,
     checkOptionKeys,
     copyPlain,
@@ -140,7 +141,7 @@ const MIN_SERVER_ERROR_STATUS = 500;
  * - binds named functions with configured model ids and merged defaults
  * - applies shared and per-model rate limits
  * - manages request retries and exponential backoff
- * - handles batch calls via separate concurrency tracking
+ * - batch calls: own queue without concurrency cap or rate limits; `limiterOptions` still apply
  * @throws {TypeError} If options, models, limits, or defaults are invalid.
  */
 export function createGenaiModels<const N extends string>(options: GenaiModelsOptions<N>): GenaiModels<N> {
@@ -198,7 +199,7 @@ function toClient(options: Omit<GenaiClientOptions, 'defaults'> | undefined): Ge
 }
 
 /**
- * Validates limiter options.
+ * Validates limiter options: non-negative integers; `maxWaitMs` also `Infinity` (no wait limit).
  * @throws {TypeError} If limiter option keys or values are unsupported.
  */
 function validateLimiterOptions(limiterOptions: GenaiLimiterOptions | undefined): GenaiLimiterOptions {
@@ -207,6 +208,9 @@ function validateLimiterOptions(limiterOptions: GenaiLimiterOptions | undefined)
     }
     checkOptionKeys(limiterOptions, LIMITER_KEYS, 'limiterOptions.');
     for (const [key, value] of Object.entries(limiterOptions)) {
+        if (key === 'maxWaitMs' && value === Number.POSITIVE_INFINITY) {
+            continue;
+        }
         if (value !== undefined && (!Number.isInteger(value) || value < 0)) {
             throw new TypeError(`Invalid value for option "limiterOptions.${key}"`);
         }
@@ -338,9 +342,10 @@ function createModel(
         buckets: limits.buckets,
         processJob: (job, context) => attempt(client, job, context.signal, false),
     });
+    // no concurrency cap: a held slot lasts until the job is final, so a cap would split and serialize jobs
     const batchQueue = createQueue<Job, GenaiOutput>({
         ...limits.limiter,
-        concurrency: limits.concurrency,
+        concurrency: UNLIMITED_CONCURRENCY,
         maxBufferSize: Number.POSITIVE_INFINITY,
         processJob: (job, context) => attempt(client, job, context.signal, true),
     });
@@ -452,14 +457,10 @@ function createModelBatch(client: GenaiClient, id: string, withBatch: GenaiDefau
             if (typeof options !== 'object' || options === null || Array.isArray(options)) {
                 throw new InvalidRequestError('Invalid value for option "options"');
             }
-            const filled = applyDefaults(defaults, { messages: [] }, options.config).config;
-            return batch.submit(
-                items.map((item) => ({
-                    key: item?.key,
-                    request: applyDefaults(defaults, toBatchRequest(item?.request, id), undefined).request,
-                })),
-                { ...options, ...(filled === undefined ? {} : { config: filled }) },
-            );
+            const requests = items.map((item) => ({ key: item?.key, request: toBatchRequest(item?.request, id) }));
+            const filled = applyBatchDefaults(defaults, requests, options.config);
+            const { config } = filled;
+            return batch.submit(filled.items, { ...options, ...(config === undefined ? {} : { config }) });
         },
         check: batch.check,
         cancel: batch.cancel,
@@ -534,7 +535,7 @@ function withCall(
     return { ok: false, error: { ...result.error, settings, attempts } };
 }
 
-/** Translates smart-limit job outcome into GenaiResult. */
+/** Translates smart-limit job outcome into `Result`. */
 function toResult(outcome: JobOutcome<GenaiOutput>, job: Job): Result<GenaiOutput, GenaiError> {
     if (outcome.ok) {
         return { ok: true, data: outcome.data };

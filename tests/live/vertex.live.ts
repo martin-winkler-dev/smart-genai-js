@@ -1,115 +1,198 @@
 // Copyright 2026 Martin Winkler
 // SPDX-License-Identifier: Apache-2.0
 
-// Live and paid: one request and one batch of one request to gemini-3.8-flash on Vertex AI.
-// Run with `bun run test:live:vertex`; never part of `bun test`. Needs env GOOGLE_CLOUD_PROJECT, VERTEX_BATCH_BUCKET
-// and gcloud application-default credentials.
+// Live (paid): the whole package on Vertex AI. Needs env GOOGLE_CLOUD_PROJECT, VERTEX_BATCH_BUCKET and gcloud
+// application-default credentials; without GOOGLE_CLOUD_PROJECT every case is skipped, without VERTEX_BATCH_BUCKET
+// the batch cases. Run with `bun run test:live:vertex`; never part of `bun test`.
+// 45 generate requests (core cases on three models, breadth on gemini-3.1-flash-lite), 6 embedding requests,
+// one batch job of eight items and one job of two batch calls (each 4 to 6 minutes).
 
 import { describe, expect, it } from 'bun:test';
 import { GoogleAuth } from 'google-auth-library';
 import { createGcsClient } from '../../src/core/batch/gcs.js';
-import { createGenaiClient, credentialsFile } from '../../src/index.js';
-import type { GenaiBatchStatus, GenaiRequest } from '../../src/types.js';
+import { createGenaiClient, createGenaiModels, credentialsFile } from '../../src/index.js';
+import type { GenaiClient } from '../../src/types.js';
+import {
+    BATCH_TIMEOUT_MS,
+    BREADTH_CASES,
+    batchItems,
+    CASE_TIMEOUT_MS,
+    coreCases,
+    expectBatchCallPair,
+    expectBatchResults,
+    expectEmbeddings,
+    expectError,
+    expectLocalValidation,
+    expectNamedModels,
+    expectOk,
+    generate,
+    log,
+    mask,
+    REQUEST_TIMEOUT_MS,
+    runBatchJob,
+    send,
+    wordMessages,
+} from './shared.js';
 
 // -------------------------------------------------------------------
 // --- 1. Constants
 // -------------------------------------------------------------------
 
-/** Target model evaluated in live Vertex test. */
-const MODEL = 'gemini-3.8-flash';
+/** Cheap model: bulk of the cases and the batch jobs. */
+const LITE = 'gemini-3.1-flash-lite';
 
-/** Polling interval for batch job. */
-const POLL_MS = 60_000;
+/** Models that run the core cases next to `LITE`. */
+const CORE_MODELS = [LITE, 'gemini-3.8-flash', 'gemini-4-hydrogen'] as const;
 
-/** Maximum wait timeout for batch job completion. */
-const MAX_WAIT_MS = 40 * 60_000;
+/** Folder of all batch files in the bucket. */
+const BATCH_ROOT = 'smart-genai/';
 
-const client = createGenaiClient({ vertex: true, timeoutMs: 120_000 });
+const HAS_PROJECT = Boolean(process.env.GOOGLE_CLOUD_PROJECT);
+const HAS_BUCKET = Boolean(process.env.VERTEX_BATCH_BUCKET);
+
+/** Client created on first use, so a run without Vertex env only skips. */
+let cached: GenaiClient | undefined;
 
 // -------------------------------------------------------------------
 // --- 2. Private Functions
 // -------------------------------------------------------------------
 
-/** Constructs classification request for test word. */
-function request(word: string): GenaiRequest {
-    return {
-        model: MODEL,
-        messages: [
-            { role: 'system', content: 'You classify invented English words by their role in a sentence.' },
-            { role: 'user', content: `Sentence: "The children ${word} the ball across the yard."` },
-        ],
-        response_format: {
-            type: 'json_schema',
-            json_schema: {
-                name: 'answer',
-                schema: {
-                    type: 'object',
-                    properties: { kind: { type: 'string', enum: ['noun', 'verb', 'adjective'] } },
-                    required: ['kind'],
-                },
-            },
-        },
-    };
+/** Vertex client from env (bucket included when set). */
+function vertex(): GenaiClient {
+    cached ??= createGenaiClient({ vertex: true, timeoutMs: REQUEST_TIMEOUT_MS });
+    return cached;
 }
 
-describe('Vertex AI (live, paid)', () => {
-    it('answers one request', async () => {
-        const started = performance.now();
-        const result = await client.generate(request('snarbled'));
-        console.log('generate', Math.round(performance.now() - started), 'ms', JSON.stringify(result));
-        expect(result).toMatchObject({ ok: true });
-        if (result.ok) {
-            expect(result.data.json).toEqual({ kind: 'verb' });
-        }
+/** Names of all batch files in the bucket. */
+async function batchFiles(): Promise<string[]> {
+    const auth = new GoogleAuth({
+        keyFilename: credentialsFile(),
+        scopes: ['https://www.googleapis.com/auth/cloud-platform'],
+    });
+    const gcs = createGcsClient({
+        bucket: process.env.VERTEX_BATCH_BUCKET as string,
+        accessToken: () => auth.getAccessToken(),
+        timeoutMs: REQUEST_TIMEOUT_MS,
+    });
+    return expectOk('bucket list', await gcs.list(BATCH_ROOT));
+}
+
+/** Runs `body`, then checks that it left no new batch files in the bucket (`check` cleanup). */
+async function expectNoLeftovers(body: () => Promise<void>): Promise<void> {
+    const before = new Set(await batchFiles());
+    await body();
+    const added = (await batchFiles()).filter((name) => !before.has(name));
+    log('batch leftovers', added.length === 0 ? 'none' : mask(added.join(', ')));
+    expect(added).toEqual([]);
+}
+
+describe.skipIf(!HAS_PROJECT)('Vertex AI (live, paid)', () => {
+    it('listModels: publisher models with id only', async () => {
+        const listed = expectOk(
+            'listModels',
+            await send(
+                'listModels',
+                () => vertex().listModels(),
+                (data) => `${data.length} models`,
+            ),
+        );
+        const ids = listed.map((model) => model.id);
+        log('listModels', CORE_MODELS.map((model) => `${model}=${ids.includes(model)}`).join(' '));
+        expect(ids).toContain('gemini-3.8-flash');
+        const flash = listed.find((model) => model.id === 'gemini-3.8-flash');
+        expect(flash?.actions).toEqual([]);
+        expect(flash?.displayName).toBeUndefined();
     });
 
-    it(
-        'runs one batch request on Vertex AI and Cloud Storage',
-        async () => {
-            const bucket = process.env.VERTEX_BATCH_BUCKET;
-            if (!bucket || !client.batch) {
-                console.log('Skipping Vertex batch test: set env VERTEX_BATCH_BUCKET');
-                return;
+    it('local validation: invalid_request without a request', async () => {
+        await expectLocalValidation(vertex(), LITE);
+    });
+
+    it('decide: unsupported without a request, aborted signal first', async () => {
+        const request = { input: 'x', questions: { q: { type: 'noul', instructions: 'Is it x?' } } } as const;
+        const unsupported = expectError('decide', await vertex().decide(request), 'unsupported');
+        expect(unsupported.retryable).toBe(false);
+        const controller = new AbortController();
+        controller.abort();
+        expectError('decide aborted', await vertex().decide(request, { signal: controller.signal }), 'aborted');
+    });
+
+    for (const model of CORE_MODELS) {
+        describe(model, () => {
+            for (const testCase of coreCases(['text', 'image', 'reasoning', 'sampling', 'search', 'tools'])) {
+                it(testCase.name, () => testCase.run(vertex(), model), CASE_TIMEOUT_MS);
             }
-            const started = performance.now();
-            const submitted = await client.batch.submit([{ key: 'a', request: request('glonked') }]);
-            console.log('submit', Math.round(performance.now() - started), 'ms', JSON.stringify(submitted));
-            expect(submitted).toMatchObject({ ok: true });
-            if (!submitted.ok) {
-                return;
-            }
-            const name = submitted.data.name;
-            let status: GenaiBatchStatus = submitted.data;
-            while (status.phase === 'running') {
-                if (performance.now() - started > MAX_WAIT_MS) {
-                    console.log(
-                        `Vertex batch still running after ${Math.round((performance.now() - started) / 1000)} s`,
-                    );
-                    return;
-                }
-                await Bun.sleep(POLL_MS);
-                const checked = await client.batch.check(name);
-                console.log('check', Math.round(performance.now() - started), 'ms', JSON.stringify(checked));
-                expect(checked).toMatchObject({ ok: true });
-                if (!checked.ok) {
-                    return;
-                }
-                status = checked.data;
-            }
-            expect(status.phase).toBe('succeeded');
-            const result = status.results?.[0]?.result;
-            expect(result).toMatchObject({ ok: true });
-            if (result?.ok) {
-                expect(result.data.json).toEqual({ kind: 'verb' });
-            }
-            const auth = new GoogleAuth({
-                keyFilename: credentialsFile(),
-                scopes: ['https://www.googleapis.com/auth/cloud-platform'],
-            });
-            const gcs = createGcsClient({ bucket, accessToken: () => auth.getAccessToken(), timeoutMs: 120_000 });
-            const left = await gcs.list('smart-genai/');
-            console.log('leftover batch files:', left.ok ? left.data : left.error);
-        },
-        MAX_WAIT_MS + 60_000,
+        });
+    }
+
+    describe(`${LITE} breadth`, () => {
+        for (const testCase of BREADTH_CASES) {
+            it(testCase.name, () => testCase.run(vertex(), LITE), CASE_TIMEOUT_MS);
+        }
+        it(
+            'models/ prefix: HTTP 404 with a message',
+            async () => {
+                const label = 'models/ prefix';
+                const result = await generate(vertex(), label, {
+                    model: `models/${LITE}`,
+                    messages: [{ role: 'user', content: 'x' }],
+                });
+                const error = expectError(label, result, 'http', 404);
+                expect(error.message.trim().length).toBeGreaterThan(0);
+            },
+            CASE_TIMEOUT_MS,
+        );
+        it(
+            'publishers/google/models/ prefix',
+            async () => {
+                const label = 'publisher prefix';
+                const result = await generate(vertex(), label, {
+                    model: `publishers/google/models/${LITE}`,
+                    messages: [{ role: 'user', content: 'Reply with the single word: ok' }],
+                    temperature: 0,
+                });
+                expect(expectOk(label, result).text.toLowerCase()).toContain('ok');
+            },
+            CASE_TIMEOUT_MS,
+        );
+        it('named models', () => expectNamedModels({ vertex: true }, LITE), CASE_TIMEOUT_MS);
+    });
+
+    describe('embeddings', () => {
+        it(
+            'gemini-embedding-2: one input per call, the query closest to its answer',
+            () => expectEmbeddings(vertex(), 'gemini-embedding-2', true),
+            CASE_TIMEOUT_MS,
+        );
+        it(
+            'publishers/google/models/gemini-embedding-001: several inputs in one call',
+            () => expectEmbeddings(vertex(), 'publishers/google/models/gemini-embedding-001', false),
+            CASE_TIMEOUT_MS,
+        );
+    });
+
+    it.skipIf(!HAS_BUCKET)(
+        'batch job: eight items of different shapes, no files left',
+        () =>
+            expectNoLeftovers(async () => {
+                expectBatchResults(await runBatchJob(vertex(), batchItems(LITE)));
+            }),
+        BATCH_TIMEOUT_MS,
+    );
+
+    it.skipIf(!HAS_BUCKET)(
+        'batch calls: two calls of a named model share one job',
+        () =>
+            expectNoLeftovers(async () => {
+                const gemini = createGenaiModels({
+                    client: { vertex: true, timeoutMs: REQUEST_TIMEOUT_MS, batchWaitSec: 5 },
+                    models: { lite: { model: LITE, modelLimits: { concurrency: 1 } } },
+                });
+                await expectBatchCallPair(
+                    (word) => gemini.lite(wordMessages(word), { batch: true, temperature: 0 }),
+                    gemini.client,
+                );
+            }),
+        BATCH_TIMEOUT_MS,
     );
 });

@@ -6,11 +6,13 @@
 [![Node.js](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2Fmartin-winkler-dev%2Fsmart-genai-js%2Fmain%2Fpackage.json&query=%24.engines.node&label=Node.js&logo=nodedotjs&color=blue)](https://nodejs.org)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-One client for Gemini on the **Gemini Developer API** (AI Studio, API key) and **Vertex AI** (Google Cloud
-credentials), supporting single requests and batch jobs using the OpenAI chat completion request format (`messages`,
-`response_format`, `tools`, `reasoning_effort`).
+Unified client for the **Gemini Developer API** (AI Studio, API key) and **Vertex AI** (Google Cloud credentials),
+supporting single requests, embeddings, Decisions (`gemini-decision-1`), named rate-limited models, and batch jobs
+using the OpenAI chat completion request shape (`messages`, `response_format`, `tools`, `reasoning_effort`).
 
 ## Installation
+
+Requires **Node.js >= 22.12.0** or **Bun >= 1.3.0**. ESM package with bundled TypeScript declarations.
 
 ```sh
 bun add smart-genai
@@ -29,31 +31,25 @@ const vertex = createGenaiClient({ vertex: true }); // project, location, bucket
 
 | Option | Default | Description |
 |---|---|---|
-| `apiKey` | env `GEMINI_API_KEY` | Developer API key (Developer API only) |
+| `apiKey` | env `GEMINI_API_KEY` | Developer API key (Developer API only; throws `TypeError` if combined with `vertex`) |
+| `vertex` | `false` | `true` or `GenaiVertexOptions` to target Vertex AI |
 | `vertex.project` | env `GOOGLE_CLOUD_PROJECT` | Google Cloud project ID (required for Vertex AI) |
-| `vertex.location` | env `GOOGLE_CLOUD_LOCATION`, else `global` | Vertex AI region or `global` |
-| `vertex.bucket` | env `VERTEX_BATCH_BUCKET` | Cloud Storage bucket name (without `gs://`) for Vertex batch files; without a bucket, Vertex has no batch (`client.batch` is `undefined`) |
-| `vertex.credentialsFile` | env `GOOGLE_APPLICATION_CREDENTIALS` | Service account or ADC file; falls back to the `gcloud auth application-default login` file |
-| `vertex.authClient` | none | Custom `AuthClient` instance (bypasses `credentialsFile` check, e.g. for GCE/Cloud Run metadata server auth) |
-| `vertex.storageUrl` | none | Custom Cloud Storage endpoint URL |
+| `vertex.location` | env `GOOGLE_CLOUD_LOCATION`, else `'global'` | Vertex AI region, `'us'`, `'eu'`, or `'global'` |
+| `vertex.bucket` | env `VERTEX_BATCH_BUCKET` | Cloud Storage bucket name (without `gs://`) for Vertex batch files; without a bucket, `client.batch` is `undefined` |
+| `vertex.credentialsFile` | env `GOOGLE_APPLICATION_CREDENTIALS` | Service account or ADC JSON file; falls back to `gcloud auth application-default login` ADC file |
+| `vertex.authClient` | none | Custom `AuthClient` instance (bypasses `credentialsFile` disk check, e.g. for GCE/Cloud Run metadata server auth) |
+| `vertex.storageUrl` | official GCS endpoint | Custom Cloud Storage endpoint URL |
 | `baseUrl` | official endpoint | Custom API endpoint URL |
 | `env` | `process.env` | Source object from which default credentials and settings are read |
-| `timeoutMs` | `120000` | HTTP timeout per call in milliseconds (120 s) |
-| `defaults` | none | Request defaults and Gemini `config` applied to every request and batch request |
-| `batchWaitSec` | `10` | Aggregation window in seconds for [batch calls](#batch-calls) (1 to 600) |
+| `timeoutMs` | `120000` | HTTP timeout per call in milliseconds (positive integer) |
+| `defaults` | none | Request defaults and Gemini `config` applied to `generate` and `batch` requests (`embed` and `decide` ignore `defaults`) |
+| `batchWaitSec` | `10` | Aggregation window in seconds for [batch calls](#batch-calls) (`1` to `600`) |
 
-The package never reads `.env` files directly. Bun loads them automatically; on Node.js use `node --env-file=.env` or
-`process.loadEnvFile()`, or pass credentials explicitly. On Vertex AI, `createGenaiClient` resolves `credentialsFile`
-(`GOOGLE_APPLICATION_CREDENTIALS` or `~/.config/gcloud/application_default_credentials.json`, `%APPDATA%\gcloud\application_default_credentials.json` on Windows), verifies the file exists on disk at client creation, and passes `keyFilename` directly to `google-auth-library` (for both Vertex AI and Cloud Storage), skipping ambient metadata-server discovery (~15 s timeout outside Google Cloud). To use attached service accounts on Cloud Run/GCE without a local key file, pass `vertex: { authClient }`.
-
-Invalid options in `createGenaiClient` and `createGenaiModels` throw a `TypeError`. Methods called on clients and models
-never throw or reject: invalid call arguments return an `{ ok: false, error: { code: 'invalid_request', ... } }` result,
-and runtime failures return an error result (`Result<T, GenaiError>`).
-
-`@google/genai` environment variables are handled safely:
-- `GOOGLE_GEMINI_BASE_URL` and `GOOGLE_VERTEX_BASE_URL` are ignored; the official endpoint or explicit `baseUrl` is always used.
-- `GOOGLE_GENAI_USE_VERTEXAI`, `GOOGLE_CLOUD_PROJECT`, and `GOOGLE_CLOUD_LOCATION` are always passed explicitly.
-- `GEMINI_API_KEY` and `GOOGLE_API_KEY`: the Developer API receives the key explicitly. Vertex AI never sends an API key. Passing `apiKey` together with `vertex` throws a `TypeError`.
+- **Environment files**: the package never reads `.env` files directly. Bun loads them automatically; on Node.js use `node --env-file=.env`, `process.loadEnvFile()`, or pass credentials explicitly.
+- **Credentials resolution**: on Vertex AI without `vertex.authClient`, `createGenaiClient` resolves `credentialsFile` (`GOOGLE_APPLICATION_CREDENTIALS`, else `$CLOUDSDK_CONFIG/application_default_credentials.json`, else `~/.config/gcloud/application_default_credentials.json` or `%APPDATA%\gcloud\application_default_credentials.json` on Windows), verifies the file exists and is non-empty on disk, and passes `keyFilename` directly to `google-auth-library` (for both Vertex AI and Cloud Storage), avoiding metadata-server timeouts outside Google Cloud.
+- **Error contract**: `createGenaiClient`, `createGenaiModels`, and `validateGenaiConfig` throw `TypeError` on invalid options or missing credentials. Methods on clients and named models (including synchronous `batch.requestBytes`) never throw or reject: they return `Result<T, GenaiError>` (`{ ok: true, data } | { ok: false, error }`).
+- **Client properties**: `client.mode` is `'developer' | 'vertex'`; `client.batch` is `GenaiBatch | undefined`.
+- **`@google/genai` env isolation**: `GOOGLE_GEMINI_BASE_URL` and `GOOGLE_VERTEX_BASE_URL` are ignored (`baseUrl` or the official endpoint is always used); `GOOGLE_GENAI_USE_VERTEXAI`, `GOOGLE_CLOUD_PROJECT`, and `GOOGLE_CLOUD_LOCATION` are passed explicitly; only `GEMINI_API_KEY` (never `GOOGLE_API_KEY`) is read for the Developer API; Vertex AI never uses an API key.
 
 ## Single request
 
@@ -74,53 +70,39 @@ if (result.ok) {
 }
 ```
 
-- **Supported fields**: `model`, `messages` (`system`, `developer`, `user`, `assistant`, `tool`; text, and images in
-  `user` messages), `response_format` (`text`, `json_object`, `json_schema`), `temperature`, `top_p`, `max_tokens` /
-  `max_completion_tokens`, `seed`, `stop`, `reasoning_effort`, `tools`, `tool_choice` (see [Tool calls](#tool-calls)),
-  `web_search`, and `batch` (see [Batch calls](#batch-calls)). Any unsupported field returns an `invalid_request` error.
-- **`reasoning_effort`** (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`): maps to thinking budgets of
-  `0` / `512` / `1024` / `8192` / `24576` tokens on Gemini 2.x, and thinking levels `MINIMAL` / `MINIMAL` / `LOW` /
-  `MEDIUM` / `HIGH` on newer models (`xhigh` and `max` match `high`). Gemini 3 cannot disable thinking, so `none` sets
-  `MINIMAL`. Gemini 2.5 Pro cannot disable thinking either, so `none` sets its minimum budget (`128`). Setting
-  `reasoning_effort` automatically enables `includeThoughts: true`, returning thought summaries in `data.reasoning`
-  (except on Gemini 2.x with budget `0`); pass `config: { thinkingConfig: { includeThoughts: false } }` to suppress
-  them. When `reasoning_effort` is omitted, no thinking configuration is sent.
-- **`web_search: true`**: enables Google Search grounding; `false` overrides a configured default. Grounding links return
-  in `data.sources` (`{ url, title? }`). Gemini's search tool does not take parameters, so OpenAI `web_search_options`
-  is not accepted.
-- **Defaults and config merging**: client `defaults` populate any field omitted by the request. `config` merges per field,
-  and `thinkingConfig` merges per member, with call-level values taking precedence. `max_tokens` and `max_completion_tokens`
-  act as aliases: setting either in a call overrides defaults for both. Defaults objects are copied upon creation, so mutating
-  them later has no effect.
-- **`json_schema.schema`**: forwarded as Gemini's `responseJsonSchema`. The `name` and `strict` fields are accepted for
-  OpenAI compatibility but not sent.
-- **Images**: passed using OpenAI syntax `{ type: 'image_url', image_url: { url: 'data:image/png;base64,...' } }` and
-  forwarded as Gemini `inlineData`. Only base64 data URLs for `image/*` MIME types are accepted (HTTP and `gs://` URLs
-  are rejected). The `detail` property is accepted and ignored.
-- **Gemini-specific options**: passed in the second parameter: `generate(request, { config: { ... }, signal })`.
+- **Supported request fields**: `model` (required unless in `defaults`), `messages` (`system`, `developer`, `user`, `assistant`, `tool`; at least one `user` message required), `response_format` (`text`, `json_object`, `json_schema`), `temperature`, `top_p`, `max_tokens`, `max_completion_tokens`, `seed`, `stop`, `reasoning_effort`, `tools`, `tool_choice` (see [Tool calls](#tool-calls)), `web_search`, and `batch` (see [Batch calls](#batch-calls)). Any unsupported field returns `invalid_request`.
+- **Field constraints**:
+  - `system` and `developer` messages are joined with `'\n\n'` into `systemInstruction` (overridden if `config.systemInstruction` is set).
+  - `temperature` and `top_p` must be finite numbers.
+  - `max_tokens` and `max_completion_tokens` must be positive integers and cannot both be set on the same request or defaults object.
+  - `seed` must be an int32 integer (`-2147483648` to `2147483647`).
+  - `stop` accepts a string or up to 5 strings.
+- **Images**: passed as `{ type: 'image_url', image_url: { url: 'data:image/png;base64,...' } }` in `user` messages and forwarded as Gemini `inlineData`. Only base64 `image/*` data URLs with non-empty payloads are accepted (HTTP and `gs://` URLs are rejected). `detail` is accepted and ignored.
+- **`response_format`**:
+  - `json_object`: sets `responseMimeType: 'application/json'` and parses `data.json`.
+  - `json_schema`: forwards `json_schema.schema` as `responseJsonSchema` (`name`, `description`, and `strict` are accepted for OpenAI compatibility and not sent). On Vertex batch, it is converted to typed `responseSchema` (see [Vertex batch request & schema constraints](#vertex-batch-request--schema-constraints)).
+  - Strips leading/trailing whitespace and an optional ```` ```json ... ``` ```` code fence before `JSON.parse`. Bypassed when the model returns `toolCalls`.
+- **`reasoning_effort`** (`'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'`):
+  - Gemini 2.x: sets `thinkingBudget` to `0` / `512` / `1024` / `8192` / `24576` (`xhigh` and `max` match `high`; `gemini-2.5-pro` uses minimum `128` for `none`).
+  - Gemini 3+ and other non-Gemma models: sets `thinkingLevel` (`LOW` / `MEDIUM` / `HIGH`, with `xhigh`/`max` as `HIGH`). `none` and `minimal` map to `MINIMAL` only on Gemini 3.0–3.6 Flash and Flash-Lite (`gemini-3-flash-preview`, `gemini-3.1-flash-lite`, etc.), and `LOW` elsewhere.
+  - Gemma (`gemma-*`): `none`, `minimal`, and `low` set `MINIMAL`; `medium`, `high`, `xhigh`, and `max` set `HIGH`.
+  - Enables `includeThoughts: true` (returning thought summaries in `data.reasoning`), except on Gemini 2.x when budget is `0`. Pass `config: { thinkingConfig: { includeThoughts: false } }` to suppress summaries. When `reasoning_effort` is omitted, no thinking configuration is sent.
+- **`web_search: true`**: enables Google Search grounding; `false` overrides a configured default. Grounding web links return in `data.sources` (`{ url, title? }`). OpenAI `web_search_options` is not supported.
+- **Defaults and config merging**: client `defaults` populate omitted request fields (deep-copied at creation, so later mutations have no effect). `config` merges per field and `thinkingConfig` merges per member, with call-level values taking precedence. Setting `max_tokens` or `max_completion_tokens` in a call overrides both in defaults.
+- **Thinking precedence**: `reasoning_effort`, `config.thinkingConfig.thinkingBudget`, and `config.thinkingConfig.thinkingLevel` act as one setting. If a call sets any of them (request or call `config`), all three are dropped from `defaults` (a dropped default `reasoning_effort` adds no `includeThoughts: true`, while an explicit default `includeThoughts` stays). Within one call, `config` `thinkingBudget` or `thinkingLevel` overrides `reasoning_effort` (while `includeThoughts: true` from `reasoning_effort` stays unless overridden). In `batch.submit`, `options.config` with a budget or level suppresses default `reasoning_effort` across all items; an item's own `reasoning_effort` combined with a budget or level set only by `defaults.config` returns `invalid_request`.
+- **Gemini options**: pass `generate(request, { config, signal })`. Call `config` must be a plain object without an own `__proto__` property, `abortSignal`, `httpOptions`, or `automaticContinuation`, and `config.tools` (if set) must be an array or `null`. SDK automatic continuation is disabled and no SDK retries run (one HTTP request per call).
 - **Result structure**:
-  - `data`: `text`, `json` (for JSON response formats), `model`, `usage` (`inputTokens`, `outputTokens`, `reasoningTokens`),
-    `finishReason`, `ms`, plus optional `reasoning`, `sources`, and `toolCalls`.
-  - `error`: `code` (`rate_limited`, `timeout`, `network`, `http`, `aborted`, `blocked`, `truncated`, `invalid_json`,
-    `invalid_request`, `unsupported`, `unexpected`, `limiter`), `message`, `retryable`, optional `status`, and `retryAfterMs`.
-- **`settings` and `attempts`**: present on successful results and valid requests that failed. `settings` reflects the
-  effective options used (model, parameters, active tools, and merged `config`). `attempts` reports total API requests
-  made (1 for normal calls, 0 if rejected before transmission). An `invalid_request` error detected prior to dispatch
-  has neither.
-- **Partial output on failure**: when a response is received but unusable (`blocked`, `truncated`, `invalid_json`, or
-  unexpected tool finish reasons), the partial response is preserved in `error.output` with its `reasoning`, `usage`,
-  and `finishReason`. Network and HTTP transport errors have no `output`.
-- **Finish reasons**: any finish reason other than `STOP` is treated as an error even if partial text arrived:
-  `MAX_TOKENS` and `CONTINUATION` produce `truncated`, failed tool executions produce `unexpected`, and safety or recitation
-  filters produce `blocked`.
-- **`retryable`**: marked `true` on HTTP 429, 408, 409, 425, 5xx, timeouts, and network connection failures. Authentication
-  errors (`invalid_grant`), missing credentials, and invalid client configurations are non-retryable `unexpected` errors.
-- **SDK isolation**: SDK automatic retries and continuation loops are disabled (one HTTP request per call). Call `config`
-  must not contain `abortSignal`, `httpOptions`, `automaticContinuation`, or an own `__proto__` property.
+  - `data`: `text`, `json?`, `reasoning?`, `sources?`, `toolCalls?`, `model`, `usage` (`inputTokens`, `outputTokens`, `reasoningTokens`; `outputTokens` excludes thinking tokens), `finishReason`, `ms`, `settings?`, `attempts?`.
+  - `error`: `code` (`rate_limited`, `timeout`, `network`, `http`, `aborted`, `blocked`, `truncated`, `invalid_json`, `limiter`, `invalid_request`, `unsupported`, `unexpected`), `message`, `retryable`, `status?`, `retryAfterMs?`, `limiterCode?`, `text?`, `model?`, `usage?`, `ms?`, `output?`, `settings?`, `attempts?`.
+- **`settings` and `attempts`**: present on successful results and on valid requests that ran or were aborted after validation. `settings` captures effective options (model, parameters, active tool names, `json`, `batch`, `web_search`, merged `config`). Pre-dispatch `invalid_request` failures have neither `settings` nor `attempts`.
+- **Finish reasons and partial output**: any finish reason other than `STOP` (or none) fails even if partial text arrived, preserving the partial `GenaiOutput` in `error.output` (and `text`, `model`, `usage`, `ms` on `error`). `MAX_TOKENS`, `CONTINUATION`, or `continuationToken` return `truncated`; `promptFeedback.blockReason` and safety/recitation stop reasons return `blocked`; missing candidate or tool finish errors (`MALFORMED_FUNCTION_CALL`, `UNEXPECTED_TOOL_CALL`, `TOO_MANY_TOOL_CALLS`, `MISSING_THOUGHT_SIGNATURE`) return `unexpected`.
+- **`retryable`**: `true` on HTTP `429` (`rate_limited`), `408`, `409`, `425`, `>= 500`, `timeout`, `network`, and `MALFORMED_FUNCTION_CALL`. Auth failures with an HTTP status return `code: 'http'` with that status and `retryable: false`.
 
 ## Tool calls
 
 ```ts
+import { assistantMessage, toolMessage, type GenaiMessage } from 'smart-genai';
+
 const tools = [
     {
         type: 'function' as const,
@@ -141,49 +123,26 @@ if (asked.ok && asked.data.toolCalls) {
     }
     const answer = await studio.generate({ model: 'gemini-3.5-flash', messages, tools });
 }
-
-// With a named model: tools are options, conversation history is input
-const named = await gemini.flash38(messages, { tools });
 ```
 
-- **Message helpers**: `assistantMessage(output)` converts model output into the next `assistant` message (including
-  `tool_calls` with thought signatures; `content` is `null` when the turn only contained tool calls). `toolMessage(call, result)`
-  formats a execution result as a `tool` message (strings preserved as-is, objects serialized to JSON).
-- **`tools` declarations**: `{ type: 'function', function: { name, description?, parameters?, strict? } }` definitions are
-  converted to Gemini `functionDeclarations`. `parameters` is sent as `parametersJsonSchema`; `strict` is accepted and not sent.
-  Function names must be 1 to 128 characters matching `^[A-Za-z0-9_.:-]+$` and unique within the request.
-- **`tool_choice`**: `'auto'` maps to `AUTO`, `'none'` to `NONE`, `'required'` to `ANY`, and
-  `{ type: 'function', function: { name } }` to `ANY` with `allowedFunctionNames: [name]`. When `tools` is omitted,
-  `tool_choice` is not sent, allowing default tool choices to sit in client defaults safely. Call-level `config.toolConfig`
-  overrides generated settings per field.
-- **Handling tool calls**: responses containing function calls succeed with `data.toolCalls` populated as
-  `{ id, type: 'function', function: { name, arguments } }` (`arguments` as JSON string). Missing Gemini call IDs are
-  assigned generated IDs (`call_<uuid>`). JSON `response_format` validation is bypassed when the model emits tool calls.
-- **Tool execution responses**: pass tool calls back in an `assistant` message and supply results as
-  `{ role: 'tool', tool_call_id, content }`. Subsequent tool messages are combined into a single Gemini `user` turn of
-  `functionResponse` parts. JSON strings representing objects are unpacked into structured JSON objects; plain strings
-  are wrapped as `{ output: text }`.
-- **Thought signatures**: Gemini 3 signs the first function call of each step and rejects histories missing the signature.
-  The signature arrives in `call.extra_content.google.thought_signature` and must accompany the call back to the model.
-  Tool calls without signatures (e.g. from other providers) receive Google's `skip_thought_signature_validator` flag on
-  the first call of their turn on Gemini 3+; Gemini 2.x receives no validator flag.
-- **`web_search` with tools**: combining `web_search: true` with `tools` is supported on Gemini 3 and newer. On Gemini 2.x,
-  combining them returns an `invalid_request` error. Server-side search execution parts are omitted (`includeServerSideToolInvocations`
-  remains off).
-- **Tool execution failures**: finish reasons `MALFORMED_FUNCTION_CALL` (retryable), `UNEXPECTED_TOOL_CALL`,
-  `TOO_MANY_TOOL_CALLS`, and `MISSING_THOUGHT_SIGNATURE` return `unexpected` errors.
-- **Validation**: malformed tool definitions, invalid `tool_choice`, invalid argument JSON, and tool messages referencing
-  unknown `tool_call_id`s return `invalid_request` errors.
+- **Message helpers**:
+  - `assistantMessage(output)` converts `GenaiOutput` into an `assistant` message (preserving `toolCalls` and thought signatures; sets `content: null` when `text === ''` and `toolCalls` is non-empty).
+  - `toolMessage(call, result)` formats an execution result as `{ role: 'tool', tool_call_id: call.id, content }`. Strings pass through as-is; other values serialize via `JSON.stringify` (`undefined`, functions, and symbols become `'null'`); non-JSON-serializable values (`BigInt`, cyclic objects) fall back to `String(result)` or `'[unserializable tool result]'`. Never throws.
+- **`tools` declarations**: `{ type: 'function', function: { name, description?, parameters?, strict? } }` converts to Gemini `functionDeclarations` (`parameters` sent as `parametersJsonSchema`, or typed `parameters` on Vertex batch; `strict` is accepted and not sent). Names must be unique and 1–128 characters matching `^[A-Za-z0-9_.:-]+$`.
+- **`tool_choice`**: `'auto'` -> `AUTO`, `'none'` -> `NONE`, `'required'` -> `ANY`, and `{ type: 'function', function: { name } }` -> `ANY` with `allowedFunctionNames: [name]`. Only sent (and reported in `settings`) when `tools` or `config.tools` (`functionDeclarations`) declares functions; named `tool_choice` must match one of those declarations. `config.toolConfig` overrides generated values per field.
+- **Receiving and returning tool calls**: `data.toolCalls` entries have `{ id, type: 'function', function: { name, arguments } }` (`arguments` is a JSON string; missing Gemini IDs get `call_<uuid>`). Consecutive `tool` messages merge into one Gemini `user` turn of `functionResponse` parts; JSON object strings unpack into objects, while other strings wrap as `{ output: text }`.
+- **Thought signatures**: Gemini 3+ signs the first function call of each step in `call.extra_content.google.thought_signature` and requires it in history. Tool calls without signatures (e.g. from another provider) receive `skip_thought_signature_validator` on the first call of their assistant turn, except on Gemini 1.x, Gemini 2.x, and non-Google publisher models (`publishers/<name>/models/...`).
+- **`web_search` + `tools`**: supported on Gemini 3+; combining them on Gemini 2.x returns `invalid_request`. Server-side tool invocations remain disabled.
+- **Validation**: empty `tools`, duplicate/invalid function names, unknown `tool_choice` names, invalid `arguments` JSON, `tool_calls` on non-assistant messages, `content: null` without `tool_calls`, or `tool` messages referencing unknown `tool_call_id`s return `invalid_request`.
 
 ## Model list
 
 ```ts
 const models = await studio.listModels();
-// models.data: [{ id: 'gemini-3.5-flash', displayName, inputTokenLimit, outputTokenLimit, actions, thinking }, …]
+// models.data: [{ id: 'gemini-3.5-flash', displayName, inputTokenLimit, outputTokenLimit, actions, thinking }, ...]
 ```
 
-Paginates across all available base models. `id` matches what `model` expects (the `models/` prefix is stripped). Listing
-models consumes no tokens. On Vertex AI, Google publisher models are listed.
+Paginates across all available base models (consumes no tokens), stripping `models/` and `publishers/<name>/models/` from `id`. On Vertex AI, publisher models report only `id` and `actions: []` (other metadata fields are omitted), so do not filter by `actions` on Vertex AI. Also exposed on named-model objects as `gemini.listModels(options?)`.
 
 ## Embeddings
 
@@ -194,28 +153,61 @@ const vectors = await studio.embed({
     taskType: 'RETRIEVAL_DOCUMENT',
     dimensions: 768,
 });
-// vectors.data: { embeddings: [[…768 numbers], […]], model: 'gemini-embedding-2', ms }
-
-const query = await studio.embed({
-    model: 'gemini-embedding-2',
-    input: 'incubation temperature',
-    taskType: 'RETRIEVAL_QUERY',
-});
+// vectors.data: { embeddings: [[...768 numbers], [...]], model: 'gemini-embedding-2', ms }
 ```
 
-- **Input capacity**: embeds 1 to 100 texts (`MAX_EMBED_INPUTS`) in a single API call, returning one embedding vector per
-  input in original order. Each text is wrapped in its own `Content` element, preventing `gemini-embedding-2` from fusing
-  them into one vector.
-- **`taskType` and `title`**: `gemini-embedding-2` ignores native API task fields, so smart-genai prefixes the text
-  according to Google's documentation (`title: Methods | text: ...`, `title: none | text: ...`, `task: search result | query: ...`).
-  Other models (`gemini-embedding-001`) use standard API fields; all inputs in a single call must share the same title.
-- **Validation**: `title` is allowed only with `RETRIEVAL_DOCUMENT`. `dimensions` sets `outputDimensionality` (Matryoshka
-  truncation); `gemini-embedding-001` returns normalized vectors only at 3072 dimensions, while `gemini-embedding-2` supports
-  all dimensions.
-- **Vertex AI limits**: on Vertex AI, `gemini-embedding-001` supports up to 100 texts per request (`predict`); other Gemini
-  models (such as `gemini-embedding-2`) support 1 text per call (`embedContent`); supplying more returns `unsupported`.
-- **No batch API**: embeddings do not support asynchronous batch jobs; passing `batch` returns `invalid_request`.
-- The embedding API does not report token usage metadata.
+- **Capacity**: 1 to 100 (`MAX_EMBED_INPUTS`) non-empty texts per call, returning one vector per input in order. Each input is wrapped in its own `Content` element so `gemini-embedding-2` does not fuse them into a single vector.
+- **Supported fields**: `model`, `input` (`string` or `{ text, title? }[]`), `taskType` (`RETRIEVAL_QUERY`, `RETRIEVAL_DOCUMENT`, `QUESTION_ANSWERING`, `FACT_VERIFICATION`, `CODE_RETRIEVAL_QUERY`, `SEMANTIC_SIMILARITY`, `CLASSIFICATION`, `CLUSTERING`), and `dimensions` (positive integer mapped to `outputDimensionality`). Options: `{ signal }`. Client `defaults` and `batch` do not apply (unknown fields return `invalid_request`).
+- **`taskType` and `title`**:
+  - `title` (non-empty string) is only allowed with `RETRIEVAL_DOCUMENT`.
+  - For `gemini-embedding-2*`, `smart-genai` applies documented text prefixes (`title: <title or none> | text: <text>` for `RETRIEVAL_DOCUMENT`; `task: <name> | query: <text>` for other tasks) instead of API `taskType`/`title` fields.
+  - Other models (e.g. `gemini-embedding-001`) receive API `taskType` and `title` fields, and all inputs in one call must share the same `title`. (`gemini-embedding-001` returns normalized vectors only at 3072 dimensions.)
+- **Vertex AI**: `publishers/google/models/` prefix is stripped before the SDK call. `gemini-embedding-001` supports up to 100 inputs per call (`predict`); other Gemini models (e.g. `gemini-embedding-2`) and `maas` models support only 1 text per call (`> 1` returns `unsupported`).
+- **Output**: `{ embeddings: number[][], model, ms }` (no token usage). Returns `unexpected` if vector count mismatches or any vector is empty.
+
+## Decisions (`gemini-decision-1`)
+
+`client.decide` calls Google's Decisions API (`POST /v1beta/decisions`) to score typed questions over a shared input with calibrated probabilities (0 output tokens).
+
+```ts
+const decision = await studio.decide({
+    input: 'This is the third time my order is late. Give me my money back.',
+    questions: {
+        damaged: {
+            type: 'noul',
+            instructions: 'Did the item arrive damaged?',
+            criteria: { true_description: 'The product is broken.', false_description: 'Any other complaint.' },
+        },
+        intent: {
+            type: 'choice',
+            instructions: 'What does the customer want?',
+            criteria: { refund: 'Money back', exchange: 'Another item', information: '' },
+        },
+        anger: {
+            type: 'score',
+            instructions: 'How angry is the customer?',
+            criteria: ['calm', 'annoyed', 'angry', 'furious'],
+        },
+    },
+});
+if (decision.ok) {
+    decision.data.answers.damaged; // { type: 'noul', noul: 0.03, confidence: 0.97 }
+    decision.data.answers.intent;  // { type: 'choice', choice: 'refund', probabilities: { refund: ..., ... }, confidence: ... }
+    decision.data.answers.anger;   // { type: 'score', score: 2.5, probabilities: { 0: ..., 3: ... }, legend: { 0: 'calm', ... }, confidence: ... }
+}
+```
+
+- **Developer API only**: returns `unsupported` on Vertex AI without sending a request. Not included on named-model wrappers; call `gemini.client.decide(...)`.
+- **Model & options**: `model` defaults to `DEFAULT_DECIDE_MODEL` (`'gemini-decision-1'`). Client `defaults` do not apply. Options: `{ signal }`; no automatic retries.
+- **Questions**: 1 to 1000 (`MAX_DECIDE_QUESTIONS`), keys 1–64 chars matching `[A-Za-z0-9_-]`. `instructions` accepts non-empty string, `{ type: 'text', text }`, or non-empty array of `{ type: 'text', text }`:
+  - `noul`: yes/no (`criteria` optional: `{ true_description?, false_description? }`). Answer: `{ type: 'noul', noul, confidence }`.
+  - `choice`: `criteria` maps 2–255 non-empty option IDs (no leading/trailing whitespace or control chars) to descriptions (`''` allowed). Answer: `{ type: 'choice', choice, probabilities, confidence }`. With literal `questions`, `choice` and `probabilities` are strictly typed by option IDs (numeric keys as strings).
+  - `score`: `criteria` lists 2–255 non-empty level strings, lowest first (2–10 recommended). Answer: `{ type: 'score', score, probabilities, legend, confidence }` keyed by level index (`'0'`, `'1'`, ...).
+- **Input**: non-empty (non-whitespace) text or non-empty array of parts:
+  - Chat parts: `{ type: 'text', text }` and `{ type: 'image_url', image_url: { url: 'data:image/png;base64,...' } }` (`detail` ignored; converted to `image` block).
+  - Media blocks: `image`, `audio`, `video`, `document` with `mime_type` and exactly one of `data` (base64) or `uri`, plus optional `resolution` (`'low' | 'medium' | 'high'` on `image` and `video`; `'ultra_high'` on `image` only).
+- **API limits**: 262,144 input tokens per request; inline base64 up to 100 MB (50 MB for PDF); external URIs up to 15 MB; no YouTube or `gs://` URLs; no batch, caching, or tools.
+- **Result**: `data` has `answers`, `usage` (`inputTokens`, `outputTokens`), `model`, and `ms`. Safety blocks map to `blocked`; missing or mismatched answer types map to `unexpected`.
 
 ## Named models
 
@@ -223,176 +215,104 @@ const query = await studio.embed({
 import { createGenaiModels } from 'smart-genai';
 
 const gemini = createGenaiModels({
-    client: { apiKey }, // client options without defaults; gemini.client is built from them
-    defaults: { temperature: 0, max_tokens: 2000 }, // shared by all models
-    sharedLimits: { concurrency: 4 }, // shared rate limit buckets across all models
-    limiterOptions: { maxRetries: 2 }, // retry and backoff options for all calls
+    client: { apiKey }, // GenaiClientOptions without defaults; creates gemini.client
+    defaults: { temperature: 0, max_tokens: 2000 },
+    sharedLimits: { concurrency: 4 },
+    limiterOptions: { maxRetries: 2 },
     models: {
         flash38: {
             model: 'gemini-3.8-flash',
             defaults: { reasoning_effort: 'low' },
-            modelLimits: { rpm: 10, tpm: 250_000 }, // limits for this model only
+            modelLimits: { rpm: 10, tpm: 250_000 },
         },
-        lite: { model: 'gemini-3.5-flash-lite', modelLimits: { intervalMs: 3000 } }, // at most one call every 3 s
+        lite: { model: 'gemini-3.5-flash-lite', modelLimits: { intervalMs: 3000 } },
+        flash: 'gemini-3.8-flash', // string shorthand for { model }
+        flashBatch: { model: 'gemini-3.8-flash', defaults: { batch: true } },
     },
 });
 
-await gemini.flash38('Summarise this abstract: …'); // string input treated as user message
-await gemini.lite(messages, { web_search: true, reasoning_effort: 'none' }); // input followed by options
+await gemini.flash38('Summarize this abstract: ...');
+await gemini.lite(messages, { web_search: true, reasoning_effort: 'none' });
 gemini.flash38.id; // 'gemini-3.8-flash'
-await gemini.flash38.batch?.submit([{ key: 'a', request: { messages } }]); // model and defaults prefilled
+await gemini.flash38.batch?.submit([{ key: 'a', request: { messages } }]);
 await gemini.listModels();
 ```
 
-- **Naming**: model names not matching JavaScript identifiers are accessed via brackets (`gemini['flash-lite']`). Property
-  names `client`, `listModels`, `then`, `toJSON`, and `Object.prototype` members (`constructor`, `toString`, `__proto__`, etc.)
-  are reserved and throw a `TypeError`. Because the underlying model ID is fixed per named function, setting `model` in a
-  model's `defaults` throws a `TypeError`, and passing `model` in a call returns an `invalid_request` error.
-- **Calling convention**: `gemini.<name>(input, options)`. `input` can be a string prompt, content parts array (text and
-  images) for a single user turn, or an array of message objects for full conversations. `options` accepts any request field
-  except `model` and `messages`, plus `signal` and Gemini `config`. Options override defaults; passing `undefined` preserves
-  the default. The returned function does not depend on `this` and can be passed as a standalone callback:
-  `const classify = (text) => gemini.flash38(text, { response_format })`.
-- **Defaults hierarchy**: global `defaults` < model-specific `defaults` < per-call `options`. The `client` property takes
-  client options without defaults; `createGenaiModels` creates its own client (`gemini.client`) to monitor all calls.
-  Specifying `max_tokens` or `max_completion_tokens` at any level overrides both from lower levels.
-- **Traceability**: results include `settings` containing `{ name: 'flash38', model: 'gemini-3.8-flash', ... }`, making
-  it easy to log which model and parameters produced the result. `attempts` tracks total API calls including retries (0 if
-  rejected by the limiter prior to dispatch).
-- **Rate limiting (`sharedLimits` and `modelLimits`)**: `createGenaiClient` performs single unthrottled requests without retries;
-  `createGenaiModels` wraps each named model in a `smart-limit` queue. Both `sharedLimits` (top-level, shared across all named
-  models in the `createGenaiModels` instance for project/provider-wide quotas) and `modelLimits` (per model inside
-  `models.<name>.modelLimits`) are optional and unset by default (no rate or concurrency limits apply unless configured;
-  `concurrency` defaults to `Infinity`). Neither overrides the other: every synchronous call must acquire capacity from both
-  `sharedLimits` buckets and its model's `modelLimits` buckets before starting. Both accept the same limit fields:
-  - `concurrency`: max simultaneous in-flight calls (`sharedLimits.concurrency` uses a cross-model `createConcurrencyBucket`;
-    `modelLimits.concurrency` caps that model's queue).
-  - `rps`, `rpm`, `rpd`: requests per second (1,000 ms), minute (60,000 ms), or day (86,400,000 ms) rolling sliding windows.
-  - `tpm`, `tpd`: tokens per minute or day rolling sliding windows.
-  - `intervalMs`: minimum spacing in ms (`createSlidingWindow({ requests: 1, perMs: intervalMs })`, e.g. `3000` for one call every 3 s).
-  - `buckets`: custom `smart-limit` `Bucket[]` instances (e.g. `createSlidingWindow({ tokens: 50_000, perMs: 10_000 })`).
-- **Limiter configuration (`limiterOptions`)**: retry and backoff settings from `smart-limit` applied to all named models
-  (always active even when `sharedLimits` and `modelLimits` are omitted):
-  - `maxRetries` (default `4`): maximum retries per call for isolated retryable errors (timeouts, HTTP 408, 409, 425, `MALFORMED_FUNCTION_CALL`).
-  - `retryDelayMs` (default `2000`): initial exponential backoff delay in milliseconds (doubles each retry).
-  - `maxRetryDelayMs` (default `300000`): maximum backoff delay cap (5 minutes).
-  - `maxWaitMs` (default `900000`): maximum wait per model queue for bucket capacity, global backoff locks, or retries (15 minutes).
-  - HTTP 429, 5xx, and network errors trigger a global queue lock (`backoff_global`) up to `maxWaitMs` and do not consume `maxRetries` (even when `maxRetries: 0`; lower `maxWaitMs` to bound outage waits).
-- **Token reservation and `charsPerToken`**: when `tpm` or `tpd` is configured, each call reserves an initial token estimate before
-  starting and settles against actual reported usage (`inputTokens + outputTokens + reasoningTokens`) upon completion, returning
-  unused tokens to the sliding window. If a call fails with 429 without reported usage, the full reservation is refunded (`0` tokens).
-  The estimate is `Math.ceil(chars / charsPerToken) + 1120 * images + (max_tokens ?? max_completion_tokens ?? 1000)`, where `chars`
-  counts message text, tool results, tool call names/arguments, and `JSON.stringify(tools)`. `charsPerToken` defaults to `4` (any
-  positive finite number, e.g. `3.5`) and can be set at the top level of `createGenaiModels` or overridden per model in
-  `models.<name>.charsPerToken`.
-- **Queue and backoff behavior**: each named model runs its own FIFO `smart-limit` queue (`createQueue`). Rate limits (429),
-  network drops, and 5xx errors lock that model's queue (for `retryAfterMs` if provided, else exponential backoff with a 1,000 ms
-  minimum) while other models continue running. Once the lock delay expires, a single probe call executes alone; waiting calls
-  resume only after a probe succeeds. If a required bucket wait or lock exceeds `maxWaitMs`, waiting and incoming calls on that
-  model fail immediately without sending network requests. Calls rejected by the limiter (e.g. estimate exceeds total `tpm` bucket
-  limit, or `maxWaitMs` exceeded before any attempt) return `{ code: 'limiter', limiterCode }` (`COST_EXCEEDS_LIMIT`,
-  `MAX_WAIT_EXCEEDED`). Calls that fail after at least one attempt (e.g. `RETRIES_EXHAUSTED` or `MAX_WAIT_EXCEEDED` after a 429)
-  return the last provider `GenaiError` (preserving `code: 'rate_limited'` and `retryAfterMs`).
-- **Cancellation**: passing an `AbortSignal` terminates queue wait, active retry delays, or in-flight HTTP requests immediately,
-  returning `{ ok: false, error: { code: 'aborted', ... } }`.
-- Batch jobs (`batch.submit`) and `listModels` bypass rate limiter queues. Batch calls (`batch: true`) wait only for the model's
-  own `modelLimits.concurrency`.
+- **Calling convention**: `gemini.<name>(input, options?)`. `input` is a `string`, non-empty `GenaiContentPart[]` (single user turn), or non-empty `GenaiMessage[]`. `options` accepts any `GenaiRequest` field except `model` and `messages`, plus `signal` and `config` (explicit `undefined` preserves defaults). Returned functions are `this`-independent.
+- **Properties & naming**: exposes `gemini.client`, `gemini.listModels`, and each model function (with `.id` and optional `.batch`). Model names not valid as JS identifiers use bracket notation (`gemini['flash-lite']`). Reserved names (`client`, `listModels`, `then`, `toJSON`, `__proto__`, and `Object.prototype` keys) throw `TypeError`. Passing a `GenaiClient` instance or `client.defaults` to `createGenaiModels`, setting `model` in defaults, or passing `model`/`messages` in call `options` is rejected (`TypeError` at creation, `invalid_request` at call time).
+- **Defaults hierarchy**: top-level `defaults` < `models.<name>.defaults` < per-call `options`.
+- **Traceability**: `settings` includes `name: '<key>'`; `attempts` reports total API attempts (`0` if rejected before dispatch).
+- **Rate limiting (`sharedLimits` & `modelLimits`)**: powered by `smart-limit`. Both accept `concurrency`, `rps`, `rpm`, `rpd`, `tpm`, `tpd`, `intervalMs` (all positive integers `>= 1`), and custom `buckets` (`Bucket[]`). `sharedLimits` applies across all models in the instance; `modelLimits` applies per model. Synchronous calls must acquire capacity from both.
+- **Retry & backoff (`limiterOptions`)**: active even without limits configured. Defaults: `maxRetries: 4`, `retryDelayMs: 2000`, `maxRetryDelayMs: 300000`, `maxWaitMs: 900000` (`Infinity` allowed for `maxWaitMs`).
+  - Timeouts, HTTP `408`/`409`/`425`, and `MALFORMED_FUNCTION_CALL` retry per call up to `maxRetries`.
+  - HTTP `429`, `5xx`, and `network` errors trigger a per-model queue lock (`backoff_global`, using `retryAfterMs` or exponential backoff with a `1000` ms minimum) up to `maxWaitMs` without consuming `maxRetries`, followed by a single probe call before resuming queued calls.
+  - Calls failing before any attempt return `code: 'limiter'` with `limiterCode` (`COST_EXCEEDS_LIMIT`, `MAX_WAIT_EXCEEDED`); calls failing after at least one attempt return the last provider `GenaiError`.
+- **Token reservation & `charsPerToken`**: when `tpm` or `tpd` is configured, each call reserves `Math.ceil(chars / charsPerToken) + 1120 * images + (max_tokens ?? max_completion_tokens ?? 1000)` tokens and settles against actual reported usage (`0` if `429` without usage). `charsPerToken` defaults to `4` (any positive finite number) and can be set globally or per model.
+- **Batch on named models**: `gemini.<name>.batch` omits `list` and `removeFiles` (use `gemini.client.batch`). Batch calls (`batch: true`) run in a separate queue per model without `concurrency` or rate/token buckets; `limiterOptions` and `signal` still apply. Calls exceeding `maxBytes` fail pre-enqueue with `invalid_request`.
 
 ## Batch
 
 ```ts
-const submitted = await vertex.batch?.submit([
-    { key: 'a', request },
-    { key: 'b', request: other }, // all items must use the same model
-]);
-
-// Check status periodically:
-const status = await vertex.batch?.check(submitted.data.name);
-// status.data.phase: 'running' | 'succeeded' | 'failed'; results: [{ key, result }]
+const batch = vertex.batch; // undefined on Vertex AI without a bucket
+if (batch) {
+    const submitted = await batch.submit([
+        { key: 'a', request },
+        { key: 'b', request: other }, // all items must share the same model
+    ]);
+    if (submitted.ok) {
+        const status = await batch.check(submitted.data.name);
+        if (status.ok && status.data.phase === 'succeeded') {
+            status.data.results; // [{ key, result }]
+        }
+    }
+}
 ```
 
-- **Vertex AI storage (`VERTEX_BATCH_BUCKET` / `vertex.bucket`)**: Vertex AI Batch Prediction requires a Cloud Storage bucket
-  (configured via `vertex.bucket` or env `VERTEX_BATCH_BUCKET`, bucket name without `gs://`; up to 100 MB per submission). Without
-  a bucket, `vertex.batch` (and `gemini.<model>.batch`) is `undefined`. On `submit`, requests are uploaded to
-  `gs://<bucket>/smart-genai/<uuid>/input.jsonl`, and Vertex AI writes results to `.../output/.../predictions.jsonl`. When `check`
-  observes a terminal state (`succeeded` or `failed`), it reads the results (if succeeded) and deletes the job's bucket folder
-  (unless `keepFiles: true` is set). If downloading output fails, the files remain in the bucket so a subsequent `check` can retry.
-- **Keeping results until stored (`check(name, { keepFiles: true })`)**: returns the results of a terminal job without deleting its
-  bucket folder, allowing `check` to be called again (e.g. if the process crashes before persisting the results). Once stored,
-  delete the folder via `cancel(name)` (which removes bucket files without re-cancelling a finished job), `removeFiles()`, or a
-  bucket lifecycle rule. On the Developer API, responses remain inline on the job resource, so `keepFiles` is a no-op.
-  ```ts
-  const done = await vertex.batch?.check(name, { keepFiles: true });
-  if (done?.ok && done.data.phase !== 'running') {
-      await store(done.data); // your persistence
-      await vertex.batch?.cancel(name); // removes the job's bucket folder
-  }
-  ```
-- **Finding jobs (`list({ displayName? })`)**: returns `[{ name, displayName?, state, phase, createTime? }]` without modifying jobs
-  or bucket files. On Vertex AI, it lists only jobs whose input is in `smart-genai/<uuid>/` in the configured bucket; on the
-  Developer API, it lists all batch jobs. To recover a job whose name was lost (e.g. if the process exited before `submit`
-  returned), persist a unique `displayName` before calling `submit(items, { displayName })` and look it up via
-  `list({ displayName })` (the default `smart-genai <n> requests` is not unique). Named model batch interfaces do not expose
-  `list`; use `client.batch.list()`.
-- **Key encoding on Vertex AI**: keys are prefixed with `j:<key>` (JSON formats) or `t:<key>` (text) to prevent BigQuery and
-  JSONL importers from coercing numeric string keys into numbers. Checking an already-cleaned-up job returns `unexpected`.
-- **Developer API**: requests and responses are exchanged inline directly within the Batch API payload (< 19 MB per submission; no
-  bucket required).
-- **Byte limits**: `batch.maxBytes` defines the maximum payload byte budget per submission (19 MB on Developer API, 100 MB on
-  Vertex AI). `requestBytes(request, config?)` returns the calculated payload size in bytes. Submissions with duplicate keys,
-  mismatched models, empty items, `batch` set inside items, or requests exceeding `maxBytes` return `invalid_request` errors.
-- **Result matching**: items are matched by `key`. Item-level errors are mapped to corresponding HTTP errors (Google RPC codes
-  are translated on Developer API; transient Vertex AI errors are classified as retryable).
-- **Job cancellation**: `cancel(name)` requests job cancellation. On Vertex AI, it also removes temporary bucket files. If a
-  job is already finished, `cancel` cleans up remaining files without re-cancelling the job.
-- **Orphaned file cleanup (`removeFiles({ keepSucceededMs? })`)**: deletes leftover batch folders on Vertex AI, returning
-  `{ removed, kept }`. All batch files reside in `smart-genai/<uuid>/`. `removeFiles` lists Vertex batch jobs and retains folders
-  belonging to non-terminal jobs (queued, pending, running, cancelling), folders of succeeded jobs that ended less than
-  `keepSucceededMs` ago (default 7 days; unknown end time is treated as recent), and folders with any object younger than one hour
-  (or with an unknown creation timestamp). It deletes all other folders under `smart-genai/`, including output of older succeeded
-  jobs that was never read via `check` (pass `{ keepSucceededMs: 0 }` to retain no succeeded jobs' folders beyond the one-hour
-  object grace period). It never touches files outside `smart-genai/`, is never called automatically, and returns `unsupported` on
-  the Developer API. Named model batch interfaces do not expose `removeFiles`; use `client.batch.removeFiles()`.
+- **Payload limits**: `batch.maxBytes` is `19_000_000` (19 MB) on the Developer API (inline) and `100_000_000` (100 MB) on Vertex AI (Cloud Storage JSONL). `batch.requestBytes(request, config?)` synchronously returns `Result<number, GenaiError>` for the encoded line excluding the item `key`.
+- **Submission (`submit(items, options?)`)**: `items` must be non-empty with unique non-empty `key`s, identical `model`, no `batch` field inside item requests, and total `requestBytes` `<= maxBytes`. `options`: `{ signal?, displayName?, config? }` (`displayName` defaults to `'smart-genai <n> requests'`, which is not unique). To recover a job whose name was lost (e.g. crash right after `submit`), persist a unique `displayName` before calling `submit(items, { displayName })` and look it up via `list({ displayName })`.
+- **Status (`check(name, options?)`)**: returns `{ name, state, phase, results?, error? }` where `phase` is `'running' | 'succeeded' | 'failed'`. Item-level RPC errors map to HTTP `GenaiError`s (`RESOURCE_EXHAUSTED`, `UNAVAILABLE`, `INTERNAL`, `DEADLINE_EXCEEDED` marked retryable on Vertex AI).
+- **Cancellation (`cancel(name, options?)`)**: cancels an active job (returns `ok` if already finished or cancelling). On Vertex AI, also removes the job's bucket folder, including for already-finished jobs.
+- **Listing (`list(options?)`)**: accepts `{ signal?, displayName? }` (exact match filter) and returns `[{ name, displayName?, state, phase, createTime? }]` without modifying jobs or files. On Vertex AI, lists only jobs whose input is directly under `smart-genai/` in the configured bucket; on Developer API, lists all project batch jobs.
+- **Crash recovery on Vertex AI (`keepFiles`)**: on Vertex AI, `submit` writes `gs://<bucket>/smart-genai/<project>_<location>_<uuid>/input.jsonl` (`:` in domain-scoped project IDs becomes `~`) and reads results from `.../output/.../*.jsonl`. Terminal `check` deletes the folder unless `keepFiles: true` is passed (a no-op on Developer API). After persisting results, delete the folder with `batch.cancel(name)`. Checking an already-cleaned-up job returns `unexpected`.
+- **Orphaned file cleanup (`removeFiles({ keepSucceededMs?, signal? })`)**: Vertex AI only (`unsupported` on Developer API); returns `{ removed, kept }`. Scans own `<project>_<location>_<uuid>` and legacy `<uuid>` folders under `smart-genai/` and retains:
+  - folders of non-terminal jobs,
+  - folders of succeeded jobs ended less than `keepSucceededMs` ago (default 7 days; unknown end time treated as recent; pass `0` to retain none past the grace period),
+  - folders containing any object younger than 1 hour (or with unknown `timeCreated`).
+
+  It deletes all other own and legacy folders, **including output of older succeeded jobs that was never read via `check`**. It never touches files outside `smart-genai/` and is never called automatically.
+- **Shared buckets**: different projects/locations sharing one bucket do not touch each other's prefixed folders, but any client's `removeFiles` treats legacy plain-UUID folders as its own and may delete those of another project's or location's jobs (input of running jobs, unread output of succeeded jobs). Let legacy jobs finish and be checked before sharing a bucket, or use one bucket per project and location.
+
+### Vertex batch request & schema constraints
+
+Vertex AI batch import rejects unsupported fields, empty JSON objects, response schema `required` arrays, and mixed schema shapes. `smart-genai` handles these at `submit` and `requestBytes` time:
+
+- **Config translation**: mirrors synchronous SDK placement (e.g. `modelSelectionConfig` -> `generationConfig.modelConfig`, `generationOutputConfig` -> `outputConfig`, short `cachedContent` -> full resource name, `imageConfig.outputMimeType` -> `imageOutputOptions.mimeType`, string `speechConfig` -> prebuilt voice). Unsupported fields (`store`, `enableEnhancedCivicAnswers`, `fileSearch`, `mcpServers`, `toolConfig.includeServerSideToolInvocations`, `partMetadata`, `toolCall`, `toolResponse`, `consentAudio`, `voiceConsentSignature`, or unknown fields) fail with `invalid_request` naming the field and item key. `automaticFunctionCalling` is omitted.
+- **Empty objects**: empty tool call `arguments` are omitted, empty tool results (`'{}'`) become `{ output: '' }`, empty `properties` on tool schemas are dropped, and `web_search` uses `{ excludeDomains: [] }`. Any remaining empty object (e.g. `properties: {}` or `items: {}` in `json_schema`, or `{ codeExecution: {} }` in `config.tools`) fails with `invalid_request`.
+- **`required` in response schemas**: removed at every depth of `json_schema` / `responseSchema` (tool parameter schemas keep `required`), so always validate parsed JSON answers against required fields.
+- **Typed schemas in Vertex batch**: `parametersJsonSchema` and `responseJsonSchema` (and typed schemas in `config`) are converted to Vertex typed form (uppercase `type`, `null` branches/types -> `nullable`, `$schema`/`$id`/`$comment`/`additionalProperties` dropped). Only `anyOf`, `default`, `description`, `enum` (strings only), `example`, `format`, `items`, `maxItems`, `maxLength`, `maxProperties`, `maximum`, `minItems`, `minLength`, `minProperties`, `minimum`, `nullable`, `pattern`, `properties`, `propertyOrdering`, `required`, `title`, and `type` are supported; other keywords (`$ref`, `$defs`, `const`, `oneOf`, `allOf`, `not`), `type` + `anyOf`, `type: 'null'` alone, or non-string `enum` values return `invalid_request`.
+- **Mixed schemas**: Vertex AI merges property names across schemas in a single job. `smart-genai` strips foreign properties from parsed `json` (updating `text` to match) and `toolCalls` arguments using the echoed line request, though one job per schema still yields cleaner model output.
 
 ## Batch calls
 
 ```ts
 const studio = createGenaiClient({ batchWaitSec: 10 });
 const [a, b] = await Promise.all([
-    studio.generate({ ...request, batch: true }), // 50% discount, results within 24 hours
+    studio.generate({ ...request, batch: true }),
     studio.generate({ ...other, batch: true }),
 ]);
-// a and b are Result<GenaiOutput, GenaiError>, exactly like standard generate calls
 ```
 
-- **Overview**: setting `batch: true` converts a single `generate` call into an asynchronous batch request. It exposes the
-  same API and returns an individual `Result<GenaiOutput, GenaiError>`, while routing the request through the Batch API.
-  `batch: false` (the default) performs a direct synchronous request. `batch: true` can be configured globally or in model
-  defaults:
-  ```ts
-  models: {
-      flash: 'gemini-3.8-flash',
-      flashBatch: { model: 'gemini-3.8-flash', defaults: { batch: true } },
-  }
-  ```
-- **Aggregation window**: requests are grouped by model and Gemini `config`. The collection window begins with the first call
-  in a group and waits `batchWaitSec` (default `10` s). When the timer expires, the group is submitted as one or more batch
-  jobs (split if total payload exceeds `maxBytes`). Any single request exceeding `maxBytes` fails immediately with an
-  `invalid_request` error without being submitted.
-- **Polling and settlement**: active batch jobs are polled every 30 seconds. Upon completion, each waiting promise resolves
-  with its specific result. If a job fails or is cancelled, every call in that job rejects with `{ code: 'unexpected', ... }`.
-  If the submission itself fails (e.g. rate limit), all grouped calls receive that error. Retryable polling errors are retried
-  automatically (respecting `retryAfterMs`).
-- **72-hour timeout**: jobs that fail to complete within 72 hours are automatically cancelled and fail with a `timeout` error.
-- **Cancellation**: aborting a call before submission removes it from the pending group. Aborting after submission resolves that
-  specific call as `aborted`; if all calls in a batch job are aborted, the batch job itself is cancelled.
-- **Prerequisites**: on Vertex AI without a configured bucket, batch calls return `unsupported`. The free Gemini Developer API
-  tier does not support batch jobs (`FAILED_PRECONDITION`); batch operations require a paid project with billing enabled.
-- **In-memory lifecycle**: batch calls and pollers live in application memory and are not persisted. If the host process exits,
-  in-flight call promises are lost while submitted jobs continue running in Google Cloud. For long-running workflows that must
-  survive restarts, use `client.batch.submit` and `client.batch.check` with your own persistence layer (`keepFiles` and `list`
-  for crash recovery, see [Batch](#batch)).
-- **Concurrency with named models**: batch calls executed through named models wait only for the model's own
-  `modelLimits.concurrency` (tracked separately from synchronous calls). They do not consume shared limits, token buckets,
-  or interval limits, and do not trigger synchronous queue locks upon encountering 429 errors.
+- **Overview**: `batch: true` (per-call or in `defaults`) routes `generate` through the Batch API (50% cost discount on Gemini Batch API) while returning an individual `Result<GenaiOutput, GenaiError>`.
+- **Grouping & splitting**: calls within `batchWaitSec` (default `10` s from the first call in a group) are grouped by `(model, config, response_format, tools)` and submitted as one or more jobs split to `batch.maxBytes`. A single request exceeding `maxBytes` fails immediately with `invalid_request`.
+- **Polling & timeout**: active jobs are polled every 30 s for up to 72 hours (then cancelled and settled with `timeout`). Retryable poll errors retry (respecting `retryAfterMs`); non-retryable poll errors settle all calls and cancel the job unless it already reached a terminal state.
+- **Job failures**: if a job fails or is cancelled, every call in that job resolves with `{ code: 'unexpected' }`. If the submission itself fails (e.g. rate limit), all grouped calls receive that error.
+- **Cancellation**: aborting before submission removes the call from its pending group (`attempts: 0`); aborting after submission settles that call as `aborted`, and cancels the batch job if all calls in it are aborted.
+- **Prerequisites & lifecycle**: returns `unsupported` on Vertex AI without a bucket; free-tier Developer API keys reject batch jobs (`FAILED_PRECONDITION`). Batch call groups and pollers live in memory: if the host process exits, in-flight call promises are lost while submitted jobs continue running (and billing) in Google Cloud. For crash-safe persistence across process restarts, use `client.batch.submit` and `client.batch.check`.
 
+## Helpers & Constants
+
+- `credentialsFile(env?)`: resolves the Google credentials path (`GOOGLE_APPLICATION_CREDENTIALS`, else `$CLOUDSDK_CONFIG/application_default_credentials.json`, else platform gcloud ADC path).
+- `mergeGenaiConfig(...configs)`: merges `GenerateContentConfig` objects left-to-right (merging `thinkingConfig` per member), skipping `undefined`.
+- `validateGenaiConfig(config, optionName)`: validates a `GenerateContentConfig` object; throws `TypeError` on invalid shape, own `__proto__`, `abortSignal`, `httpOptions`, `automaticContinuation`, or invalid `tools`.
+- Constants: `GEMINI_API_KEY_ENV` (`'GEMINI_API_KEY'`), `VERTEX_ENV` (`{ project, location, bucket, credentialsFile }`), `MAX_EMBED_INPUTS` (`100`), `DEFAULT_DECIDE_MODEL` (`'gemini-decision-1'`), `MAX_DECIDE_QUESTIONS` (`1000`).
+- Types: all `Genai*` types, `Result<T, E>`, and `AuthClient` (from `google-auth-library`) are exported from `'smart-genai'`.

@@ -23,9 +23,32 @@ export function assistantMessage(output: Pick<GenaiOutput, 'text' | 'toolCalls'>
     };
 }
 
-/** Formats tool call result as `tool` message: string as-is, other values serialized to JSON. */
+/**
+ * **Formats tool call result as `tool` message**: never throws.
+ *
+ * - string: as-is
+ * - other values: JSON; `'null'` for `undefined`, functions and symbols
+ * - not JSON-serializable (BigInt, cyclic): `String(result)`
+ * - `String(result)` throws too: `'[unserializable tool result]'`
+ */
 export function toolMessage(call: Pick<GenaiToolCall, 'id'>, result: unknown): GenaiMessage {
-    const content = typeof result === 'string' ? result : (JSON.stringify(result) ?? 'null');
+    const content = typeof result === 'string' ? result : serializeToolResult(result);
     // biome-ignore lint/style/useNamingConvention: OpenAI field name
     return { role: 'tool', tool_call_id: call.id, content };
+}
+
+// -------------------------------------------------------------------
+// --- 2. Private Functions
+// -------------------------------------------------------------------
+
+function serializeToolResult(result: unknown): string {
+    try {
+        return JSON.stringify(result) ?? 'null';
+    } catch {
+        try {
+            return String(result);
+        } catch {
+            return '[unserializable tool result]';
+        }
+    }
 }

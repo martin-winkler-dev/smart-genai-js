@@ -7,7 +7,7 @@
       "dependencies": {
         "@google/genai": "^2.31.0",
         "google-auth-library": "^10.9.1",
-        "smart-limit": "^0.1.0",
+        "smart-limit": "^0.2.0",
       },
       "devDependencies": {
         "@arethetypeswrong/cli": "^0.18.5",
@@ -241,7 +241,7 @@
 
     "skin-tone": ["skin-tone@2.0.0", "", { "dependencies": { "unicode-emoji-modifier-base": "^1.0.0" } }, "sha512-kUMbT1oBJCpgrnKoSr0o6wPtvRWT9W9UKvGLwfJYO2WuahZRHOpEyL1ckyMGgMWh0UdpmaoFqKKD29WTomNEGA=="],
 
-    "smart-limit": ["smart-limit@0.1.0", "", {}, "sha512-b2aB1Q+h17w+IagbKxLxEmPlduXd+X1rtuPK1KKN3LS96XDqFFlLRClHG2NTufM1qgUwtL4AjfcODFJusm/Z1g=="],
+    "smart-limit": ["smart-limit@0.2.0", "", {}, "sha512-xVE4Km+4W+FU6elXIjdwtvebcpEh3iv4zyToi7JSDX5fQrmcjNKmBPVOpQggrCtEh9OOlZhzt9BjgaVQFQ0Fkw=="],
 
     "smartin": ["smartin@0.4.0", "", { "bin": { "smartin": "dist/smartin.js" } }, "sha512-s6QL30aRbA5wlMU0iJ7iQKgy9T9o5nwRBLfL27P1xL6G+grzbgFB2ZoJ2olSEA0YQdeLvbm9gkUqy6YAc+SjTQ=="],
 

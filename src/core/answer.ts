@@ -30,7 +30,7 @@ import { InvalidRequestError } from './request.js';
 export const RETRYABLE_STATUSES: ReadonlySet<number> = new Set([408, 409, 425]);
 
 /** Maps Google RPC codes to corresponding HTTP status codes. */
-const RPC_HTTP_STATUS: Readonly<Record<number, number>> = {
+export const RPC_HTTP_STATUS: Readonly<Record<number, number>> = {
     1: 499,
     2: 500,
     3: 400,
@@ -90,7 +90,7 @@ const MATCH_CODE_FENCE = /^```(?:json)?\s*\n?([\s\S]*?)\n?```$/i;
  * - parses grounding metadata into citations
  * - extracts function call requests into `toolCalls`
  * - validates finish reasons; flags prompt blocks, truncation, and tool errors
- * - parses JSON text when `json` requested
+ * - parses JSON text when `json` requested without tool calls
  */
 export function readAnswer(
     response: GenerateContentResponse,
@@ -134,8 +134,7 @@ export function readAnswer(
         const message = 'No candidate in the response';
         return { ok: false, error: { code: 'unexpected', message, retryable: false, ...answered } };
     }
-    const continuation = (response as { continuationToken?: unknown }).continuationToken;
-    if (finishReason === 'MAX_TOKENS' || finishReason === 'CONTINUATION' || continuation) {
+    if (finishReason === 'MAX_TOKENS' || finishReason === 'CONTINUATION' || candidate.continuationToken) {
         const message = `Answer truncated, finish reason ${finishReason ?? 'none'}`;
         return { ok: false, error: { code: 'truncated', message, retryable: false, ...answered } };
     }
@@ -165,6 +164,8 @@ export function readAnswer(
  *
  * - maps abort signals to `aborted`
  * - maps API and auth status codes via `statusError`
+ * - SDK wrapper of empty error body (`null`, blank `error.message` without details): treated as empty message
+ * - maps `TimeoutError` and `AbortError` (when signal not aborted) to `timeout`
  * - detects network and socket disconnects as `network`
  * - maps remaining exceptions to `unexpected`
  */
@@ -175,7 +176,8 @@ export function toGenaiError(error: unknown, signal: AbortSignal | undefined): G
     }
     const status = error instanceof ApiError ? error.status : authStatus(error);
     if (status !== undefined) {
-        return statusError(status, message, status === 429 ? readRetryDelayMs(message) : undefined);
+        const text = error instanceof ApiError && isEmptyErrorBody(message) ? '' : message;
+        return statusError(status, text, status === 429 ? readRetryDelayMs(message) : undefined);
     }
     if (error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError')) {
         return { code: 'timeout', message, retryable: true };
@@ -190,8 +192,9 @@ export function toGenaiError(error: unknown, signal: AbortSignal | undefined): G
     return { code: 'unexpected', message, retryable: false };
 }
 
-/** Maps HTTP status code and message to `GenaiError`. */
-export function statusError(status: number, message: string, retryAfterMs?: number): GenaiError {
+/** Maps HTTP status code and message to `GenaiError`; empty or whitespace-only message becomes `HTTP <status>`. */
+export function statusError(status: number, text: string, retryAfterMs?: number): GenaiError {
+    const message = text.trim() === '' ? `HTTP ${status}` : text;
     if (status === 429) {
         return {
             code: 'rate_limited',
@@ -209,7 +212,7 @@ export function rpcError(code: number | undefined, message: string): GenaiError 
     return statusError(code === undefined ? 500 : (RPC_HTTP_STATUS[code] ?? 500), message);
 }
 
-/** Maps batch job state string to high-level lifecycle phase (`running`, `succeeded`, or `failed`). */
+/** Maps batch job state to lifecycle phase (`running`, `succeeded`, or `failed`). */
 export function batchPhase(state: string): GenaiBatchStatus['phase'] {
     if (SUCCEEDED_STATES.has(state)) {
         return 'succeeded';
@@ -287,6 +290,26 @@ export function guardBatch<
     };
 }
 
+/** Extracts recommended retry delay in milliseconds from RPC RetryInfo detail of JSON error body. */
+export function readRetryDelayMs(message: string): number | undefined {
+    let body: unknown;
+    try {
+        body = JSON.parse(message);
+    } catch {
+        return undefined;
+    }
+    const details = (body as { error?: { details?: unknown } } | null)?.error?.details;
+    for (const detail of Array.isArray(details) ? details : []) {
+        const { '@type': type, retryDelay } = detail as { '@type'?: unknown; retryDelay?: unknown };
+        const match =
+            type === RETRY_INFO_TYPE && typeof retryDelay === 'string' ? MATCH_DURATION.exec(retryDelay) : null;
+        if (match?.[1] !== undefined) {
+            return Math.round(Number(match[1]) * 1000);
+        }
+    }
+    return undefined;
+}
+
 /** Calculates elapsed milliseconds since start timestamp. */
 export function elapsedMs(startedAt: number): number {
     return Math.round(performance.now() - startedAt);
@@ -315,6 +338,32 @@ function thrownError(error: unknown): GenaiError {
     const message = error instanceof Error ? error.message : String(error);
     const code = error instanceof InvalidRequestError ? 'invalid_request' : 'unexpected';
     return { code, message, retryable: false };
+}
+
+/**
+ * **Checks whether SDK `ApiError` message carries no error text**: SDK stringifies response body as message.
+ *
+ * - empty JSON body: `null`
+ * - empty text body: `{"error":{"message":"","code":...,"status":...}}`
+ * - JSON body with blank or missing `error.message` and no `details`
+ */
+function isEmptyErrorBody(message: string): boolean {
+    let body: unknown;
+    try {
+        body = JSON.parse(message);
+    } catch {
+        return false;
+    }
+    if (body === null) {
+        return true;
+    }
+    const inner = (body as { error?: unknown }).error;
+    if (typeof inner !== 'object' || inner === null) {
+        return false;
+    }
+    const { message: text, details } = inner as { message?: unknown; details?: unknown };
+    const blank = text === undefined || (typeof text === 'string' && text.trim() === '');
+    return blank && (details === undefined || (Array.isArray(details) && details.length === 0));
 }
 
 /** Extracts HTTP response status from google-auth-library error if present. */
@@ -350,24 +399,4 @@ function readUsage(usage: GenerateContentResponseUsageMetadata | undefined): Gen
         outputTokens: usage?.candidatesTokenCount ?? null,
         reasoningTokens: usage?.thoughtsTokenCount ?? null,
     };
-}
-
-/** Extracts recommended retry delay in milliseconds from RPC RetryInfo detail. */
-function readRetryDelayMs(message: string): number | undefined {
-    let body: unknown;
-    try {
-        body = JSON.parse(message);
-    } catch {
-        return undefined;
-    }
-    const details = (body as { error?: { details?: unknown } }).error?.details;
-    for (const detail of Array.isArray(details) ? details : []) {
-        const { '@type': type, retryDelay } = detail as { '@type'?: unknown; retryDelay?: unknown };
-        const match =
-            type === RETRY_INFO_TYPE && typeof retryDelay === 'string' ? MATCH_DURATION.exec(retryDelay) : null;
-        if (match?.[1] !== undefined) {
-            return Math.round(Number(match[1]) * 1000);
-        }
-    }
-    return undefined;
 }

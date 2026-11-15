@@ -43,4 +43,22 @@ describe('toolMessage', () => {
         });
         expect(toolMessage(call, undefined)).toEqual({ role: 'tool', tool_call_id: 'c1', content: 'null' });
     });
+
+    it('sends null for values JSON has no text for', () => {
+        expect(toolMessage(call, () => 1).content).toBe('null');
+        expect(toolMessage(call, Symbol('s')).content).toBe('null');
+    });
+
+    it('falls back to String() for values JSON cannot serialize instead of throwing', () => {
+        expect(toolMessage(call, 10n).content).toBe('10');
+        const cyclic: Record<string, unknown> = { a: 1 };
+        cyclic.self = cyclic;
+        expect(toolMessage(call, cyclic).content).toBe('[object Object]');
+    });
+
+    it('sends a placeholder when String() throws too', () => {
+        const cyclic: Record<string, unknown> = Object.create(null);
+        cyclic.self = cyclic;
+        expect(toolMessage(call, cyclic).content).toBe('[unserializable tool result]');
+    });
 });

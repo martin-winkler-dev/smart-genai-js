@@ -2,13 +2,22 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'bun:test';
+import { ThinkingLevel } from '@google/genai';
 import { createRPM } from 'smart-limit';
 import { batchTiming } from '../../../src/core/batch/calls.js';
 import { createGenaiClient } from '../../../src/core/client.js';
 import { assistantMessage, toolMessage } from '../../../src/core/messages.js';
 import type { GenaiClientOptions, GenaiMessage, GenaiModel, GenaiModelInput } from '../../../src/types.js';
 import { createGenaiModels } from '../../../src/wrapper/named-models.js';
-import { apiError, batchResponse, generateBody, generateResponse, startFakeGemini } from '../fake-gemini.js';
+import {
+    apiError,
+    batchResponse,
+    generateBody,
+    generateResponse,
+    sentBatch,
+    sentConfig,
+    startFakeGemini,
+} from '../fake-gemini.js';
 
 // -------------------------------------------------------------------
 // --- 1. Constants
@@ -61,7 +70,7 @@ describe('client defaults', () => {
         );
         const second = server.received[1];
         expect(second?.path).toBe('/v1beta/models/gemini-2.5-y:generateContent');
-        expect(second?.body?.generationConfig.thinkingConfig).toEqual({ thinkingBudget: 1024, includeThoughts: false });
+        expect(sentConfig(second).thinkingConfig).toEqual({ thinkingBudget: 1024, includeThoughts: false });
         expect(second?.body?.tools).toBeUndefined();
     });
 
@@ -134,8 +143,8 @@ describe('client defaults', () => {
                 { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
             ]);
         }
-        expect(server.received[2]?.body?.generationConfig.stopSequences).toEqual(['END']);
-        expect(server.received[3]?.body?.generationConfig.stopSequences).toEqual(['STOP']);
+        expect(sentConfig(server.received[2]).stopSequences).toEqual(['END']);
+        expect(sentConfig(server.received[3]).stopSequences).toEqual(['STOP']);
     });
 
     it('treat max_tokens and max_completion_tokens as one field', async () => {
@@ -160,6 +169,60 @@ describe('client defaults', () => {
             { maxOutputTokens: 500 },
             { maxOutputTokens: 300 },
             { maxOutputTokens: 100 },
+        ]);
+    });
+
+    it('treat reasoning_effort, thinkingBudget and thinkingLevel as one setting; the call wins', async () => {
+        const client = createGenaiClient(
+            clientOptions({
+                defaults: {
+                    model: 'gemini-3-x',
+                    reasoning_effort: 'low',
+                    config: { thinkingConfig: { thinkingBudget: 100 } },
+                },
+            }),
+        );
+        const messages: GenaiMessage[] = [{ role: 'user', content: 'hi' }];
+        const effort = await client.generate({ messages, reasoning_effort: 'high' });
+        const budget = await client.generate({ messages }, { config: { thinkingConfig: { thinkingBudget: 10 } } });
+        const level = await client.generate(
+            { messages },
+            { config: { thinkingConfig: { thinkingLevel: ThinkingLevel.MEDIUM } } },
+        );
+        await client.generate({ messages });
+        expect(effort.ok && effort.data.settings).toMatchObject({ reasoning_effort: 'high' });
+        expect(budget.ok && budget.data.settings).not.toHaveProperty('reasoning_effort');
+        expect(level.ok && level.data.settings?.config).toEqual({
+            thinkingConfig: { thinkingLevel: ThinkingLevel.MEDIUM },
+        });
+        expect(server.received.map((received) => sentConfig(received).thinkingConfig)).toEqual([
+            { thinkingLevel: 'HIGH', includeThoughts: true },
+            { thinkingBudget: 10 },
+            { thinkingLevel: 'MEDIUM' },
+            // both from the defaults: the config wins as within one call
+            { thinkingBudget: 100, includeThoughts: true },
+        ]);
+    });
+
+    it('resolve the thinking setting by source for named models too', async () => {
+        const gemini = createGenaiModels({
+            client: clientOptions(),
+            defaults: { config: { thinkingConfig: { thinkingBudget: 100, includeThoughts: false } } },
+            models: {
+                flash: { model: 'gemini-3-flash', defaults: { reasoning_effort: 'high' } },
+                lite: {
+                    model: 'gemini-3-flash',
+                    defaults: { config: { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } } },
+                },
+            },
+        });
+        await gemini.flash('a');
+        await gemini.flash('b', { config: { thinkingConfig: { thinkingBudget: 10 } } });
+        await gemini.lite('c', { reasoning_effort: 'medium' });
+        expect(server.received.map((received) => sentConfig(received).thinkingConfig)).toEqual([
+            { thinkingLevel: 'HIGH', includeThoughts: false },
+            { thinkingBudget: 10, includeThoughts: false },
+            { thinkingLevel: 'MEDIUM', includeThoughts: false },
         ]);
     });
 
@@ -571,6 +634,27 @@ describe('createGenaiModels', () => {
         expect(await gemini.flash('b')).toMatchObject({ ok: false, error: { limiterCode: 'MAX_WAIT_EXCEEDED' } });
     });
 
+    it('accepts maxWaitMs: Infinity as no wait limit, rejects -Infinity and NaN', async () => {
+        const gemini = createGenaiModels({
+            client: clientOptions(),
+            limiterOptions: { maxWaitMs: Number.POSITIVE_INFINITY },
+            models: { flash: 'gemini-3-flash' },
+        });
+        expect(await gemini.flash('a')).toMatchObject({ ok: true });
+        for (const maxWaitMs of [Number.NEGATIVE_INFINITY, Number.NaN]) {
+            expect(() =>
+                createGenaiModels({ client: clientOptions(), limiterOptions: { maxWaitMs }, models: { a: 'm' } }),
+            ).toThrow(/^Invalid value for option "limiterOptions\.maxWaitMs"$/);
+        }
+        expect(() =>
+            createGenaiModels({
+                client: clientOptions(),
+                limiterOptions: { maxRetries: Number.POSITIVE_INFINITY },
+                models: { a: 'm' },
+            }),
+        ).toThrow(/^Invalid value for option "limiterOptions\.maxRetries"$/);
+    });
+
     it('ends a call waiting for its limits or a lock as aborted when its signal fires', async () => {
         const gemini = createGenaiModels({
             client: clientOptions(),
@@ -712,6 +796,43 @@ describe('createGenaiModels', () => {
         expect(fake.texts).toEqual(['first']);
     });
 
+    it('resolves the thinking setting of batch items by source, for clients and named models', async () => {
+        const defaults = { reasoning_effort: 'low', config: { thinkingConfig: { thinkingBudget: 100 } } } as const;
+        const client = createGenaiClient(clientOptions({ defaults: { model: 'gemini-3-flash', ...defaults } }));
+        const gemini = createGenaiModels({ client: clientOptions(), defaults, models: { flash: 'gemini-3-flash' } });
+        const own = {
+            key: 'own',
+            request: { messages: [{ role: 'user' as const, content: 'x' }], reasoning_effort: 'high' as const },
+        };
+        const plain = { key: 'plain', request: { messages: [{ role: 'user' as const, content: 'y' }] } };
+        for (const batch of [client.batch, gemini.flash.batch]) {
+            expect(await batch?.submit([plain, own])).toMatchObject({
+                ok: false,
+                error: {
+                    code: 'invalid_request',
+                    message: expect.stringContaining('Option "reasoning_effort" of item "own" is not supported'),
+                },
+            });
+        }
+        expect(server.received).toHaveLength(0);
+        server.reply(() => batchResponse('batches/b1', 'BATCH_STATE_PENDING'));
+        const level = { thinkingConfig: { thinkingLevel: ThinkingLevel.MEDIUM } };
+        for (const batch of [client.batch, gemini.flash.batch]) {
+            expect(await batch?.submit([plain, own], { config: level })).toMatchObject({ ok: true });
+            expect(await batch?.submit([plain])).toMatchObject({ ok: true });
+        }
+        const sent = server.received.map((received) =>
+            sentBatch(received).inputConfig.requests.requests.map((entry) => entry.request.generationConfig),
+        );
+        const fromConfig = [
+            { thinkingConfig: { thinkingLevel: 'MEDIUM' } },
+            { thinkingConfig: { thinkingLevel: 'MEDIUM', includeThoughts: true } },
+        ];
+        // both from the defaults: the config wins as within one call
+        const fromDefaults = [{ thinkingConfig: { thinkingBudget: 100, includeThoughts: true } }];
+        expect(sent).toEqual([fromConfig, fromDefaults, fromConfig, fromDefaults]);
+    });
+
     it('submits batches with the model id and defaults', async () => {
         const gemini = createGenaiModels({
             client: clientOptions(),
@@ -725,7 +846,7 @@ describe('createGenaiModels', () => {
         expect(submitted).toMatchObject({ ok: true, data: { name: 'batches/b1' } });
         const sent = server.received[0];
         expect(sent?.path).toBe('/v1beta/models/gemini-3-flash:batchGenerateContent');
-        expect(sent?.body?.batch.inputConfig.requests.requests[0].request.generationConfig).toEqual({ temperature: 0 });
+        expect(sentBatch(sent).inputConfig.requests.requests[0].request.generationConfig).toEqual({ temperature: 0 });
     });
 
     it('reports tool_choice in the settings only with tools, as a copy', async () => {
@@ -922,10 +1043,10 @@ describe('batch calls of named models', () => {
         Object.assign(batchTiming, timing);
     });
 
-    /** Configures fake batch server taking batchMs and tracking peak concurrency. */
+    /** Configures fake batch server taking batchMs and tracking peak concurrency and job sizes. */
     function batchServer(batchMs: number, errors: Response[] = []) {
         const jobs = new Map<string, { at: number; keys: string[]; done: boolean }>();
-        const state = { submits: 0, maxRunning: 0 };
+        const state = { submits: 0, maxRunning: 0, sizes: [] as number[] };
         let running = 0;
         server.reply((request) => {
             if (request.path.endsWith(':batchGenerateContent')) {
@@ -935,8 +1056,9 @@ describe('batch calls of named models', () => {
                     return error;
                 }
                 const name = `batches/b${jobs.size + 1}`;
-                const requests = request.body?.batch.inputConfig.requests.requests as { metadata: { key: string } }[];
+                const requests = sentBatch(request).inputConfig.requests.requests;
                 jobs.set(name, { at: Date.now(), keys: requests.map((entry) => entry.metadata.key), done: false });
+                state.sizes.push(requests.length);
                 running++;
                 state.maxRunning = Math.max(state.maxRunning, running);
                 return batchResponse(name, 'BATCH_STATE_PENDING');
@@ -990,7 +1112,7 @@ describe('batch calls of named models', () => {
         expect(server.received).toHaveLength(0);
     });
 
-    it('wait only for the model concurrency, also longer than maxWaitMs; other limits stay for normal calls', async () => {
+    it('collect batch calls in one job despite the model concurrency; limits stay for normal calls', async () => {
         const state = batchServer(40);
         const gemini = createGenaiModels({
             client: clientOptions({ batchWaitSec: 1 }),
@@ -1005,7 +1127,7 @@ describe('batch calls of named models', () => {
             gemini.flash('z', batch),
         ]);
         expect(results.every((result) => result.ok)).toBe(true);
-        expect(state).toEqual({ submits: 3, maxRunning: 1 });
+        expect(state).toEqual({ submits: 1, maxRunning: 1, sizes: [3] });
         expect(await gemini.flash('normal')).toMatchObject({ ok: false, error: { limiterCode: 'COST_EXCEEDS_LIMIT' } });
     });
 
@@ -1029,7 +1151,7 @@ describe('batch calls of named models', () => {
         expect(state.submits).toBe(2);
     });
 
-    it('run a later batch while an earlier one waits for its retry, so the retry wait frees the slot', async () => {
+    it('run a later batch while an earlier one waits for its retry, also with model concurrency 1', async () => {
         const state = batchServer(1, [apiError(503)]);
         const gemini = createGenaiModels({
             client: clientOptions({ batchWaitSec: 1 }),

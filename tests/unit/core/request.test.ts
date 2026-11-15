@@ -3,9 +3,18 @@
 
 import { describe, expect, it } from 'bun:test';
 import { FunctionCallingConfigMode, type GenerateContentConfig, ThinkingLevel } from '@google/genai';
-import { batchModel, toGeminiCall, wantsJson } from '../../../src/core/request.js';
+import {
+    applyBatchDefaults,
+    applyDefaults,
+    batchModel,
+    InvalidRequestError,
+    toGeminiCall,
+    toSettings,
+    validateDefaults,
+    wantsJson,
+} from '../../../src/core/request.js';
 import { mergeGenaiConfig, validateGenaiConfig } from '../../../src/index.js';
-import type { GenaiRequest, GenaiTool } from '../../../src/types.js';
+import type { GenaiReasoningEffort, GenaiRequest, GenaiTool } from '../../../src/types.js';
 
 // -------------------------------------------------------------------
 // --- 1. Constants
@@ -181,6 +190,41 @@ describe('toGeminiCall', () => {
             expect(() => toGeminiCall(value as GenaiRequest, undefined)).toThrow(new TypeError(message));
         }
     });
+
+    it('checks seed as int32, stop count and image payload', () => {
+        const base: GenaiRequest = { model: 'm', messages: [{ role: 'user', content: 'hi' }] };
+        function image(url: string): GenaiRequest {
+            return { ...base, messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url } }] }] };
+        }
+        const five = ['a', 'b', 'c', 'd', 'e'];
+        for (const seed of [0, -(2 ** 31), 2 ** 31 - 1]) {
+            expect(toGeminiCall({ ...base, seed }, undefined).config).toEqual({ seed });
+        }
+        expect(toGeminiCall({ ...base, stop: five }, undefined).config).toEqual({ stopSequences: five });
+        expect(toGeminiCall({ ...base, stop: 'a' }, undefined).config).toEqual({ stopSequences: ['a'] });
+        expect(toGeminiCall(image('data:image/png;base64,AA=='), undefined).contents).toEqual([
+            { role: 'user', parts: [{ inlineData: { mimeType: 'image/png', data: 'AA==' } }] },
+        ]);
+        const noImage = 'Invalid value for option "messages": an image must be a base64 data URL';
+        const badSeed = 'Invalid value for option "seed": an int32 integer';
+        const badStop = 'Invalid value for option "stop": up to 5 sequences';
+        const invalid: [GenaiRequest, string][] = [
+            [{ ...base, seed: 1.5 }, badSeed],
+            [{ ...base, seed: 2 ** 31 }, badSeed],
+            [{ ...base, seed: -(2 ** 31) - 1 }, badSeed],
+            [{ ...base, stop: [...five, 'f'] }, badStop],
+            [image('data:image/png;base64,'), noImage],
+            [image('data:image/png;base64,=='), noImage],
+        ];
+        for (const [value, message] of invalid) {
+            expect(() => toGeminiCall(value, undefined)).toThrow(new TypeError(message));
+        }
+        expect(() => validateDefaults({ seed: 3, stop: five })).not.toThrow();
+        expect(() => validateDefaults({ seed: 1.5 })).toThrow(new TypeError(badSeed));
+        expect(() => batchModel([{ key: '1', request: { ...base, stop: [...five, 'f'] } }])).toThrow(
+            new TypeError(badStop),
+        );
+    });
 });
 
 describe('toGeminiCall with tools', () => {
@@ -279,6 +323,56 @@ describe('toGeminiCall with tools', () => {
         expect(toGeminiCall(noTools, undefined).config).toEqual({});
     });
 
+    it('applies and reports tool_choice with function declarations only in config.tools', () => {
+        const request: GenaiRequest = {
+            model: 'm',
+            messages: [{ role: 'user', content: 'hi' }],
+            tool_choice: 'required',
+        };
+        const config: GenerateContentConfig = { tools: [{ functionDeclarations: [{ name: 'get_time' }] }] };
+        const call = toGeminiCall(request, config);
+        expect(call.config).toEqual({
+            tools: [{ functionDeclarations: [{ name: 'get_time' }] }],
+            toolConfig: { functionCallingConfig: { mode: FunctionCallingConfigMode.ANY } },
+        });
+        expect(toSettings(request, config, 'm').tool_choice).toBe('required');
+        const named = { type: 'function' as const, function: { name: 'get_time' } };
+        expect(toGeminiCall({ ...request, tool_choice: named }, config).config.toolConfig).toEqual({
+            functionCallingConfig: { mode: FunctionCallingConfigMode.ANY, allowedFunctionNames: ['get_time'] },
+        });
+        expect(() => toGeminiCall({ ...request, tool_choice: { ...named, function: { name: 'x' } } }, config)).toThrow(
+            'Invalid value for option "tool_choice.function.name": the name of one of "tools"',
+        );
+    });
+
+    it('drops tool_choice when config.tools has no function declarations', () => {
+        const request: GenaiRequest = {
+            model: 'm',
+            messages: [{ role: 'user', content: 'hi' }],
+            tool_choice: { type: 'function', function: { name: 'get_time' } },
+        };
+        const config: GenerateContentConfig = { tools: [{ googleSearch: {} }] };
+        expect(toGeminiCall(request, config).config).toEqual({ tools: [{ googleSearch: {} }] });
+        expect(toSettings(request, config, 'm')).not.toHaveProperty('tool_choice');
+    });
+
+    it('accepts a named tool_choice declared in either tools or config.tools', () => {
+        const config: GenerateContentConfig = { tools: [{ functionDeclarations: [{ name: 'get_weather' }] }] };
+        const base: GenaiRequest = { model: 'm', messages: [{ role: 'user', content: 'hi' }], tools: [time] };
+        for (const name of ['get_time', 'get_weather']) {
+            const call = toGeminiCall({ ...base, tool_choice: { type: 'function', function: { name } } }, config);
+            expect(call.config.tools).toEqual([
+                { functionDeclarations: [{ name: 'get_weather' }] },
+                { functionDeclarations: [{ name: 'get_time' }] },
+            ]);
+            expect(call.config.toolConfig).toEqual({
+                functionCallingConfig: { mode: FunctionCallingConfigMode.ANY, allowedFunctionNames: [name] },
+            });
+        }
+        const required = { ...base, tool_choice: 'required' as const };
+        expect(toSettings(required, config, 'm')).toMatchObject({ tools: ['get_time'], tool_choice: 'required' });
+    });
+
     it('combines tools with web_search outside Gemini 2.x and adds config tools first', () => {
         const call = toGeminiCall(
             { model: 'gemini-3-flash', messages: [{ role: 'user', content: 'hi' }], tools: [time], web_search: true },
@@ -289,6 +383,39 @@ describe('toGeminiCall with tools', () => {
             { functionDeclarations: [{ name: 'get_time' }] },
             { googleSearch: {} },
         ]);
+    });
+
+    it('accepts null config.tools as unset with and without tools or web_search', () => {
+        const hi: GenaiRequest = { model: 'gemini-3-flash', messages: [{ role: 'user', content: 'hi' }] };
+        const config = { tools: null } as unknown as GenerateContentConfig;
+        expect(toGeminiCall(hi, config).config).toEqual({ tools: null } as never);
+        expect(toGeminiCall({ ...hi, tools: [time] }, config).config.tools).toEqual([
+            { functionDeclarations: [{ name: 'get_time' }] },
+        ]);
+        expect(toGeminiCall({ ...hi, web_search: true }, config).config.tools).toEqual([{ googleSearch: {} }]);
+        expect(toGeminiCall({ ...hi, tool_choice: 'required' }, config).config).not.toHaveProperty('toolConfig');
+        expect(toSettings({ ...hi, tool_choice: 'required' }, config, 'm')).not.toHaveProperty('tool_choice');
+        expect(() => applyDefaults({ temperature: 0 }, hi, config)).not.toThrow();
+        expect(() => validateDefaults({ config })).not.toThrow();
+    });
+
+    it('throws InvalidRequestError for non-array config.tools with and without tools or web_search', () => {
+        const hi: GenaiRequest = { model: 'gemini-3-flash', messages: [{ role: 'user', content: 'hi' }] };
+        const requests: GenaiRequest[] = [
+            hi,
+            { ...hi, tools: [time] },
+            { ...hi, web_search: true },
+            { ...hi, tool_choice: 'required' },
+        ];
+        const message = 'Invalid value for option "config.tools"';
+        for (const tools of [{}, 'x', 1]) {
+            const config = { tools } as unknown as GenerateContentConfig;
+            for (const entry of requests) {
+                expect(() => toGeminiCall(entry, config)).toThrow(new InvalidRequestError(message));
+            }
+            expect(() => applyDefaults({ temperature: 0 }, hi, config)).toThrow(new InvalidRequestError(message));
+            expect(() => validateDefaults({ config })).toThrow(new InvalidRequestError(message));
+        }
     });
 
     it('keeps assistant text beside calls and fills a missing first signature outside Gemini 2.x', () => {
@@ -322,6 +449,44 @@ describe('toGeminiCall with tools', () => {
         ]);
         const gemini2 = toGeminiCall({ model: 'gemini-2.5-flash', messages, tools: [time] }, undefined);
         expect(gemini2.contents[1]?.parts?.[1]).toEqual({ functionCall: { id: 'c', name: 'get_time', args: {} } });
+    });
+
+    it('fills a missing first signature except for Gemini 1.x, Gemini 2.x and non-Google publisher models', () => {
+        const messages: GenaiRequest['messages'] = [
+            { role: 'user', content: 'Time?' },
+            {
+                role: 'assistant',
+                content: null,
+                tool_calls: [{ id: 'c', type: 'function', function: { name: 'get_time', arguments: '{}' } }],
+            },
+        ];
+        /** Returns the thought signature of the first call part for the model. */
+        function signatureFor(model: string): unknown {
+            return toGeminiCall({ model, messages, tools: [time] }, undefined).contents[1]?.parts?.[0]
+                ?.thoughtSignature;
+        }
+        for (const model of [
+            'gemini-1.5-pro',
+            'models/gemini-1.0-pro',
+            'gemini-2.5-flash',
+            'publishers/google/models/gemini-2.0-flash',
+            'publishers/anthropic/models/claude-sonnet-4',
+            'publishers/meta/models/llama-4-maverick',
+        ]) {
+            expect(signatureFor(model), model).toBeUndefined();
+        }
+        for (const model of [
+            'gemini-3.8-flash',
+            'gemini-4-hydrogen',
+            'publishers/google/models/gemini-3-pro',
+            'gemini-flash-latest',
+            'tunedModels/my-model-123',
+            'projects/p/locations/us-central1/endpoints/123',
+            'gemma-3-27b-it',
+            'some-unknown-model',
+        ]) {
+            expect(signatureFor(model), model).toBe('skip_thought_signature_validator');
+        }
     });
 
     it('throws a TypeError for invalid tools, tool_choice and tool messages', () => {
@@ -514,6 +679,172 @@ describe('reasoning_effort', () => {
         );
         expect(thinking(base)).toBeUndefined();
     });
+
+    it('maps none and minimal to MINIMAL only on Gemini 3.0 to 3.6 Flash and Flash-Lite, else LOW', () => {
+        function level(model: string, effort: GenaiReasoningEffort) {
+            return toGeminiCall({ ...base, model, reasoning_effort: effort }, undefined).config.thinkingConfig;
+        }
+        const minimal = [
+            'gemini-3-flash-preview',
+            'gemini-3.1-flash-lite',
+            'gemini-3.5-flash',
+            'gemini-3.5-flash-lite',
+            'gemini-3.6-flash',
+            'models/gemini-3.6-flash',
+            'publishers/google/models/gemini-3.1-flash-lite',
+        ];
+        const low = [
+            'gemini-3.1-pro-preview',
+            'gemini-3.7-flash',
+            'gemini-3.8-flash',
+            'gemini-4-argon',
+            'gemini-4-carbon',
+            'gemini-4-hydrogen',
+            'gemini-3.10-flash',
+            'gemini-3.5-flashy',
+            'publishers/google/models/gemini-3.8-flash',
+            'my-model',
+        ];
+        for (const effort of ['none', 'minimal'] as const) {
+            for (const model of minimal) {
+                expect(level(model, effort)).toEqual({ thinkingLevel: ThinkingLevel.MINIMAL, includeThoughts: true });
+            }
+            for (const model of low) {
+                expect(level(model, effort)).toEqual({ thinkingLevel: ThinkingLevel.LOW, includeThoughts: true });
+            }
+        }
+        expect(level('gemini-3.6-flash', 'low')).toEqual({ thinkingLevel: ThinkingLevel.LOW, includeThoughts: true });
+        expect(level('gemini-4-hydrogen', 'medium')).toEqual({
+            thinkingLevel: ThinkingLevel.MEDIUM,
+            includeThoughts: true,
+        });
+    });
+
+    it('maps none, minimal and low to MINIMAL and the others to HIGH on Gemma models, with or without prefix', () => {
+        function level(model: string, effort: GenaiReasoningEffort) {
+            return toGeminiCall({ ...base, model, reasoning_effort: effort }, undefined).config.thinkingConfig;
+        }
+        const expected: Record<GenaiReasoningEffort, ThinkingLevel> = {
+            none: ThinkingLevel.MINIMAL,
+            minimal: ThinkingLevel.MINIMAL,
+            low: ThinkingLevel.MINIMAL,
+            medium: ThinkingLevel.HIGH,
+            high: ThinkingLevel.HIGH,
+            xhigh: ThinkingLevel.HIGH,
+            max: ThinkingLevel.HIGH,
+        };
+        const models = [
+            'gemma-4-26b-a4b-it',
+            'gemma-4-31b-it',
+            'models/gemma-4-31b-it',
+            'publishers/google/models/gemma-4-26b-a4b-it',
+        ];
+        for (const model of models) {
+            for (const [effort, thinkingLevel] of Object.entries(expected) as [GenaiReasoningEffort, ThinkingLevel][]) {
+                expect(level(model, effort)).toEqual({ thinkingLevel, includeThoughts: true });
+            }
+        }
+        expect(level('my-gemma-4', 'low')).toEqual({ thinkingLevel: ThinkingLevel.LOW, includeThoughts: true });
+        expect(level('gemini-3.8-flash', 'medium')).toEqual({
+            thinkingLevel: ThinkingLevel.MEDIUM,
+            includeThoughts: true,
+        });
+    });
+});
+
+describe('thinking setting', () => {
+    const base: GenaiRequest = { model: 'gemini-3-flash', messages: [{ role: 'user', content: 'hi' }] };
+    const flash2: GenaiRequest = { ...base, model: 'gemini-2.5-flash' };
+
+    it('takes budget or level from the config over reasoning_effort of the same call; keeps includeThoughts', () => {
+        function thinking(request: GenaiRequest, config: GenerateContentConfig) {
+            return toGeminiCall(request, config).config.thinkingConfig;
+        }
+        expect(thinking({ ...base, reasoning_effort: 'low' }, { thinkingConfig: { thinkingBudget: 100 } })).toEqual({
+            thinkingBudget: 100,
+            includeThoughts: true,
+        });
+        expect(
+            thinking({ ...flash2, reasoning_effort: 'high' }, { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }),
+        ).toEqual({ thinkingLevel: ThinkingLevel.LOW, includeThoughts: true });
+        expect(
+            thinking(
+                { ...base, reasoning_effort: 'high' },
+                { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW, includeThoughts: false } },
+            ),
+        ).toEqual({ thinkingLevel: ThinkingLevel.LOW, includeThoughts: false });
+        expect(thinking({ ...flash2, reasoning_effort: 'none' }, { thinkingConfig: { thinkingBudget: 50 } })).toEqual({
+            thinkingBudget: 50,
+        });
+    });
+
+    it('drops all three from the defaults when the call sets one; keeps default includeThoughts', () => {
+        const budget = { thinkingConfig: { thinkingBudget: 100, includeThoughts: false } };
+        const fromEffort = applyDefaults(
+            { config: budget, temperature: 0 },
+            { ...base, reasoning_effort: 'low' },
+            undefined,
+        );
+        expect(fromEffort.config).toEqual({ thinkingConfig: { includeThoughts: false } });
+        expect(toGeminiCall(fromEffort.request, fromEffort.config).config).toEqual({
+            temperature: 0,
+            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW, includeThoughts: false },
+        });
+        const fromBudget = applyDefaults({ reasoning_effort: 'high' }, base, {
+            thinkingConfig: { thinkingBudget: 10 },
+        });
+        expect(fromBudget.request).not.toHaveProperty('reasoning_effort');
+        expect(toGeminiCall(fromBudget.request, fromBudget.config).config.thinkingConfig).toEqual({
+            thinkingBudget: 10,
+        });
+        const fromLevel = applyDefaults({ config: { thinkingConfig: { thinkingBudget: 100 }, topK: 2 } }, base, {
+            thinkingConfig: { thinkingLevel: ThinkingLevel.HIGH },
+        });
+        expect(fromLevel.config).toEqual({ topK: 2, thinkingConfig: { thinkingLevel: ThinkingLevel.HIGH } });
+        const level = { thinkingConfig: { thinkingLevel: ThinkingLevel.HIGH } };
+        expect(applyDefaults({ config: level }, base, { thinkingConfig: { thinkingBudget: 5 } }).config).toEqual({
+            thinkingConfig: { thinkingBudget: 5 },
+        });
+    });
+
+    it('keeps the defaults when the call sets none of them, undefined included', () => {
+        const defaults = { reasoning_effort: 'low', config: { thinkingConfig: { thinkingBudget: 100 } } } as const;
+        const filled = applyDefaults(
+            defaults,
+            { ...base, reasoning_effort: undefined } as never,
+            {
+                thinkingConfig: { thinkingBudget: undefined, includeThoughts: false },
+            } as never,
+        );
+        expect(filled.request.reasoning_effort).toBe('low');
+        expect(filled.config).toEqual({ thinkingConfig: { thinkingBudget: 100, includeThoughts: false } });
+        // both from the defaults: the config wins as within one call
+        expect(toGeminiCall(filled.request, filled.config).config.thinkingConfig).toEqual({
+            thinkingBudget: 100,
+            includeThoughts: false,
+        });
+    });
+
+    it('rejects an item reasoning_effort in batch only against a budget or level of the defaults config', () => {
+        const items = [
+            { key: 'a', request: base },
+            { key: 'b', request: { ...base, reasoning_effort: 'high' as const } },
+        ];
+        const budget = { config: { thinkingConfig: { thinkingBudget: 100 } } };
+        expect(() => applyBatchDefaults(budget, items, undefined)).toThrow(
+            'Option "reasoning_effort" of item "b" is not supported together with "defaults.config.thinkingConfig.thinkingBudget" or "thinkingLevel"',
+        );
+        const level = { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } };
+        const own = applyBatchDefaults(budget, items, level);
+        expect(own.config).toEqual(level);
+        expect(own.items.map((item) => item.request.reasoning_effort)).toEqual([undefined, 'high']);
+        const effort = applyBatchDefaults({ reasoning_effort: 'low', config: { topK: 1 } }, items, level);
+        expect(effort.items.map((item) => item.request.reasoning_effort)).toEqual([undefined, 'high']);
+        expect(effort.config).toEqual({ topK: 1, ...level });
+        const filled = applyBatchDefaults({ reasoning_effort: 'low' }, items, undefined);
+        expect(filled.items.map((item) => item.request.reasoning_effort)).toEqual(['low', 'high']);
+        expect(filled.config).toBeUndefined();
+    });
 });
 
 describe('mergeGenaiConfig', () => {
@@ -546,6 +877,7 @@ describe('validateGenaiConfig', () => {
     it('accepts plain objects and throws a TypeError naming the option otherwise', () => {
         expect(() => validateGenaiConfig({}, 'config')).not.toThrow();
         expect(() => validateGenaiConfig({ temperature: 0, thinkingConfig: {} }, 'config')).not.toThrow();
+        expect(() => validateGenaiConfig({ tools: null }, 'config')).not.toThrow();
         const invalid: [unknown, string][] = [
             [undefined, 'Invalid value for option "gemini.config"'],
             [null, 'Invalid value for option "gemini.config"'],
@@ -555,6 +887,7 @@ describe('validateGenaiConfig', () => {
             [{ abortSignal: new AbortController().signal }, 'Option "gemini.config.abortSignal" is not supported'],
             [{ httpOptions: {} }, 'Option "gemini.config.httpOptions" is not supported'],
             [{ automaticContinuation: false }, 'Option "gemini.config.automaticContinuation" is not supported'],
+            [{ tools: {} }, 'Invalid value for option "gemini.config.tools"'],
         ];
         for (const [config, message] of invalid) {
             expect(() => validateGenaiConfig(config, 'gemini.config')).toThrow(new TypeError(message));

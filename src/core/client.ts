@@ -21,10 +21,12 @@ import type {
 import { elapsedMs, guard, guardBatch, readAnswer, toGenaiError } from './answer.js';
 import { type BatchCalls, createBatchCalls } from './batch/calls.js';
 import { createGcsClient } from './batch/gcs.js';
-import { createInlineBatch } from './batch/inline.js';
+import { createInlineBatch, type InlineBatchRest } from './batch/inline.js';
 import { createVertexBatch } from './batch/vertex.js';
+import { createDecide } from './decide.js';
 import { createEmbed } from './embed.js';
 import {
+    applyBatchDefaults,
     applyDefaults,
     checkOptionKeys,
     copyPlain,
@@ -63,6 +65,9 @@ const DEFAULT_LOCATION = 'global';
 /** Official endpoint URL for Gemini Developer API. */
 const DEVELOPER_BASE_URL = 'https://generativelanguage.googleapis.com/';
 
+/** API version of Gemini Developer API; SDK default, set explicitly for direct REST calls. */
+const DEVELOPER_API_VERSION = 'v1beta';
+
 /** Multi-regional locations supported by Vertex AI. */
 const MULTI_REGIONAL_LOCATIONS: ReadonlySet<string> = new Set(['us', 'eu']);
 
@@ -99,8 +104,8 @@ const MAX_BATCH_WAIT_SEC = 600;
 /** Supported option keys for `listModels`. */
 const LIST_OPTION_KEYS: ReadonlySet<string> = new Set(['signal']);
 
-/** Maximum page size for model listing queries. */
-const LIST_PAGE_SIZE = 1000;
+/** Page size for model listing queries; Vertex rejects values above 300. */
+const LIST_PAGE_SIZE = 100;
 
 /** Matches API resource prefix on model identifiers. */
 const MATCH_MODEL_PREFIX = /^(?:publishers\/[^/]+\/)?models\//;
@@ -115,8 +120,13 @@ const VERTEX_KEYS: ReadonlySet<string> = new Set([
     'storageUrl',
 ]);
 
-/** Matches valid Cloud Storage bucket naming rules. */
-const MATCH_BUCKET_NAME = /^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$/;
+/**
+ * **Matches allowed characters of Cloud Storage bucket name**: lengths checked by `isBucketName`.
+ *
+ * - lowercase letters, digits, `-`, `_`, `.`
+ * - starts and ends with letter or digit, at least 3 characters
+ */
+const MATCH_BUCKET_NAME = /^[a-z0-9][a-z0-9._-]+[a-z0-9]$/;
 
 /** Supported option keys for `generate` calls. */
 const CALL_OPTION_KEYS: ReadonlySet<string> = new Set(['signal', 'config']);
@@ -130,7 +140,7 @@ const CALL_OPTION_KEYS: ReadonlySet<string> = new Set(['signal', 'config']);
  *
  * - Developer API: uses `apiKey` or `GEMINI_API_KEY`
  * - Vertex AI: authenticates via credentials file or `authClient`
- * - disables automatic continuation and retries in underlying SDK
+ * - disables automatic continuation in underlying SDK
  * - never reads `.env` files directly
  * @throws {TypeError} If options are invalid or required credentials missing.
  */
@@ -143,9 +153,11 @@ export function createGenaiClient(options: GenaiClientOptions = {}): GenaiClient
         if (!apiKey) {
             throw new TypeError(`Invalid value for option "apiKey": set it or env ${GEMINI_API_KEY_ENV}`);
         }
-        const httpOptions = { timeout, baseUrl: options.baseUrl ?? DEVELOPER_BASE_URL };
-        const ai = new GoogleGenAI({ apiKey, vertexai: false, httpOptions });
-        return buildClient('developer', ai, createInlineBatch(ai), options);
+        const baseUrl = options.baseUrl ?? DEVELOPER_BASE_URL;
+        const httpOptions = { timeout, baseUrl };
+        const ai = new GoogleGenAI({ apiKey, vertexai: false, apiVersion: DEVELOPER_API_VERSION, httpOptions });
+        const rest = { apiKey, baseUrl, apiVersion: DEVELOPER_API_VERSION, timeoutMs: timeout };
+        return buildClient('developer', ai, createInlineBatch(ai, rest), options, rest);
     }
     if (options.apiKey !== undefined) {
         throw new TypeError('Option "apiKey" is not supported with "vertex"');
@@ -172,19 +184,23 @@ export function createGenaiClient(options: GenaiClientOptions = {}): GenaiClient
         timeoutMs: timeout,
         ...(vertex.storageUrl === undefined ? {} : { baseUrl: vertex.storageUrl }),
     });
-    return buildClient('vertex', ai, createVertexBatch(ai, gcs), options);
+    return buildClient('vertex', ai, createVertexBatch(ai, gcs, vertex), options);
 }
 
 /**
  * **Resolves path to Google credentials file**.
  *
  * - checks `GOOGLE_APPLICATION_CREDENTIALS`
+ * - then ADC file in `CLOUDSDK_CONFIG` (gcloud directory itself, no `gcloud` subfolder)
  * - falls back to default gcloud ADC file path by platform
  */
 export function credentialsFile(env: Readonly<Record<string, string | undefined>> = process.env): string {
     const fromEnv = env[VERTEX_ENV.credentialsFile];
     if (fromEnv) {
         return fromEnv;
+    }
+    if (env.CLOUDSDK_CONFIG) {
+        return join(env.CLOUDSDK_CONFIG, 'application_default_credentials.json');
     }
     const configDir =
         process.platform === 'win32'
@@ -197,12 +213,13 @@ export function credentialsFile(env: Readonly<Record<string, string | undefined>
 // --- 4. Private Functions
 // -------------------------------------------------------------------
 
-/** Assembles client instance for specified operational mode. */
+/** Assembles client instance for mode; `rest` enables `decide` on Developer API. */
 function buildClient(
     mode: GenaiClient['mode'],
     ai: GoogleGenAI,
     batch: GenaiBatch | undefined,
     options: GenaiClientOptions,
+    rest?: InlineBatchRest,
 ): GenaiClient {
     // A copy, so changing the defaults object later changes no request.
     const defaults = copyPlain(options.defaults);
@@ -213,6 +230,7 @@ function buildClient(
         ...(batch === undefined ? {} : { batch: defaults === undefined ? batch : withDefaults(batch, defaults) }),
         generate: createGenerate(ai, defaults, calls),
         embed: createEmbed(ai, mode),
+        decide: createDecide(rest),
         listModels: createListModels(ai),
     };
 }
@@ -261,7 +279,7 @@ function createGenerate(
     });
 }
 
-/** Attaches effective settings and attempt counter (default 1) to generation result. */
+/** Attaches effective settings and attempt count (default 1) to generation result. */
 function withSettings(
     result: Result<GenaiOutput, GenaiError>,
     settings: GenaiSettings,
@@ -281,14 +299,16 @@ function withDefaults(batch: GenaiBatch, withBatch: GenaiDefaults): GenaiBatch {
             return batch.requestBytes(filled.request, filled.config);
         },
         submit(items, options = {}) {
-            const filled = Array.isArray(items)
-                ? items.map((item) => ({ ...item, request: applyDefaults(defaults, item?.request, undefined).request }))
-                : items;
             if (typeof options !== 'object' || options === null || Array.isArray(options)) {
                 throw new InvalidRequestError('Invalid value for option "options"');
             }
-            const { config } = applyDefaults(defaults, { messages: [] }, options.config);
-            return batch.submit(filled, { ...options, ...(config === undefined ? {} : { config }) });
+            if (!Array.isArray(items)) {
+                const { config } = applyDefaults(defaults, { messages: [] }, options.config);
+                return batch.submit(items, { ...options, ...(config === undefined ? {} : { config }) });
+            }
+            const filled = applyBatchDefaults(defaults, items, options.config);
+            const { config } = filled;
+            return batch.submit(filled.items, { ...options, ...(config === undefined ? {} : { config }) });
         },
         check: batch.check,
         cancel: batch.cancel,
@@ -425,7 +445,7 @@ function resolveVertex(vertex: GenaiVertexOptions, env: Readonly<Record<string, 
         throw new TypeError('Invalid value for option "vertex.location": a Vertex AI location such as global');
     }
     const bucket = vertex.bucket ?? (env[VERTEX_ENV.bucket] || undefined);
-    if (bucket !== undefined && !MATCH_BUCKET_NAME.test(bucket)) {
+    if (bucket !== undefined && !isBucketName(bucket)) {
         throw new TypeError('Invalid value for option "vertex.bucket": a bucket name without gs://');
     }
     const resolved: ResolvedVertex = {
@@ -444,6 +464,22 @@ function resolveVertex(vertex: GenaiVertexOptions, env: Readonly<Record<string, 
         );
     }
     return { ...resolved, credentialsFile: file };
+}
+
+/**
+ * **Checks Cloud Storage bucket name**: allowed characters plus length rules.
+ *
+ * - without dots: 3 to 63 characters
+ * - with dots: up to 222 characters, each dot-separated component 1 to 63 characters
+ */
+function isBucketName(name: string): boolean {
+    if (!MATCH_BUCKET_NAME.test(name)) {
+        return false;
+    }
+    if (!name.includes('.')) {
+        return name.length <= 63;
+    }
+    return name.length <= 222 && name.split('.').every((part) => part.length >= 1 && part.length <= 63);
 }
 
 /** Checks whether file exists, is regular file, and is non-empty without throwing. */

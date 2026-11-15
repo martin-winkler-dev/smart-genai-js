@@ -3,6 +3,7 @@
 
 import type { GenerateContentConfig } from '@google/genai';
 import type { GenaiBatch, GenaiBatchStatus, GenaiError, GenaiOutput, GenaiRequest, Result } from '../../types.js';
+import { isFinalJobError } from './final.js';
 
 // -------------------------------------------------------------------
 // --- 1. Types
@@ -56,9 +57,9 @@ export const batchTiming = { pollMs: 30_000, maxPollMs: 72 * 3_600_000, msPerSec
 /**
  * **Manages batch request collection and polling lifecycle**.
  *
- * - groups calls by model and config
+ * - groups calls by model, config, `response_format` and `tools`: Vertex job mixes property names of its schemas
  * - flushes after collection window closes or when chunk reaches `maxBytes`
- * - polls batch job status until completion; gives up (and cancels) after `maxPollMs`
+ * - polls batch job status until completion; gives up (and cancels) after `maxPollMs` or fatal check error
  * - settles individual call promises upon job completion or failure
  */
 export function createBatchCalls(batch: GenaiBatch, waitSec: number): BatchCalls {
@@ -111,9 +112,9 @@ export function createBatchCalls(batch: GenaiBatch, waitSec: number): BatchCalls
     }
 
     /**
-     * **Polls the job after `batchTiming.pollMs`** (or a longer `retryAfterMs`).
+     * **Polls job after `batchTiming.pollMs`** (or longer `retryAfterMs`).
      *
-     * - last poll at `maxPollMs` after the submit, then cancels the job
+     * - last poll at `maxPollMs` after submit, then cancels job
      */
     function schedulePoll(job: Job, retryAfterMs = 0): void {
         const leftMs = batchTiming.maxPollMs - (Date.now() - (job.submittedAt ?? 0));
@@ -132,7 +133,11 @@ export function createBatchCalls(batch: GenaiBatch, waitSec: number): BatchCalls
         );
     }
 
-    /** One poll; settles the calls of a final job. */
+    /**
+     * **Polls job once**; settles calls of final job.
+     *
+     * - non-retryable check error: settles all calls with it; cancels job unless `check` found it final
+     */
     async function poll(job: Job): Promise<void> {
         if (job.done) {
             return;
@@ -147,6 +152,10 @@ export function createBatchCalls(batch: GenaiBatch, waitSec: number): BatchCalls
                     schedulePoll(job, checked.error.retryAfterMs);
                 } else {
                     finish(job, () => checked);
+                    // a final job keeps its files (Vertex `cancel` removes them)
+                    if (!isFinalJobError(checked.error)) {
+                        void batch.cancel(job.name as string).catch(() => undefined);
+                    }
                 }
                 return;
             }
@@ -231,7 +240,12 @@ export function createBatchCalls(batch: GenaiBatch, waitSec: number): BatchCalls
                         resolve(result);
                     },
                 };
-                const id = JSON.stringify([request.model, stableJson(config)]);
+                const id = JSON.stringify([
+                    request.model,
+                    stableJson(config),
+                    stableJson(request.response_format),
+                    stableJson(request.tools),
+                ]);
                 let group = groups.get(id);
                 if (group === undefined) {
                     const timer = setTimeout(() => flush(id, config), waitSec * batchTiming.msPerSecond);

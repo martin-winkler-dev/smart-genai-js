@@ -10,6 +10,6 @@
     "noUnusedParameters": false,
     "types": ["bun"]
   },
-  "include": ["src", "tests/types"],
+  "include": ["src", "tests", "scripts"],
   "exclude": ["node_modules", "dist"]
 }

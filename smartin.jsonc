@@ -1,5 +1,5 @@
 {
-  "version": "0.4.0", // smartin package version, not project version
+  "version": "0.4.0", // smartin version that wrote this file
   "eol": "LF",
   "license": {
     "copyright": {
@@ -18,7 +18,7 @@
   },
   "spec": {
     "code": ["src/**/*.ts"], // gitignore syntax, "!" excludes
-    "tests": ["tests/**/*.ts"], // gitignore syntax, "!" excludes
+    "tests": ["tests/**/*.ts"], // gitignore syntax, "!" excludes, false = off
     "idLength": 4
   }
 }
