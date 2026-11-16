@@ -15,6 +15,7 @@ import type {
     GenaiClientOptions,
     GenaiError,
     GenaiErrorCode,
+    GenaiLimiterOptions,
     GenaiMessage,
     GenaiOutput,
     GenaiRequest,
@@ -56,6 +57,14 @@ export const REQUEST_TIMEOUT_MS = 120_000;
 /** Data URL of a 32x32 PNG filled with pure red (`#ff0000`). */
 export const RED_PNG =
     'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAJ0lEQVR42u3NsQkAAAjAsP7/tF7hIASyp6lTCQQCgUAgEAgEgi/BAjLD/C5w/SM9AAAAAElFTkSuQmCC';
+
+/**
+ * **Limiter options of live named models**: retries by smart-limit only, no repeats by `send`.
+ *
+ * - 429/5xx/network backoff does not consume `maxRetries`; bounded by `maxWaitMs`
+ * - `maxWaitMs` must stay below test timeout (`CASE_TIMEOUT_MS`)
+ */
+export const LIVE_LIMITER: GenaiLimiterOptions = { maxRetries: 3, maxWaitMs: 60_000 };
 
 /** Repeats of a request after a retryable 5xx (overload) or a rate limit (requests per minute of a free key). */
 const MAX_RETRIES = 2;
@@ -699,8 +708,19 @@ export async function send<T>(
         await Bun.sleep(pauseMs);
         result = await request();
     }
-    const ms = Math.round(performance.now() - startedAt);
-    log(label, `${ms} ms ${result.ok ? `ok ${describe(result.data)}` : `FAIL ${describeError(result.error)}`}`);
+    logResult(label, startedAt, result, describe);
+    return result;
+}
+
+/** Sends one live request without repeats and logs it like `send`; for calls retried by smart-limit. */
+export async function sendOnce<T>(
+    label: string,
+    request: () => Promise<Result<T, GenaiError>>,
+    describe: (data: T) => string,
+): Promise<Result<T, GenaiError>> {
+    const startedAt = performance.now();
+    const result = await request();
+    logResult(label, startedAt, result, describe);
     return result;
 }
 
@@ -1130,6 +1150,17 @@ export function wordMessages(word: string): GenaiMessage[] {
 // -------------------------------------------------------------------
 // --- 4. Private Functions
 // -------------------------------------------------------------------
+
+/** Logs ms since `startedAt` and compact result of one sent request. */
+function logResult<T>(
+    label: string,
+    startedAt: number,
+    result: Result<T, GenaiError>,
+    describe: (data: T) => string,
+): void {
+    const ms = Math.round(performance.now() - startedAt);
+    log(label, `${ms} ms ${result.ok ? `ok ${describe(result.data)}` : `FAIL ${describeError(result.error)}`}`);
+}
 
 /** Retryable server error such as HTTP 503 overload, or a rate limit. */
 function isTransient(error: GenaiError): boolean {

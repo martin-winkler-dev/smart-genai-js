@@ -19,7 +19,7 @@ import { checkOptionKeys, InvalidRequestError } from './request.js';
 // -------------------------------------------------------------------
 
 /** Input with its title read from `GenaiEmbedInput`. */
-type EmbedText = { text: string; title?: string };
+export type EmbedText = { text: string; title?: string };
 
 // -------------------------------------------------------------------
 // --- 2. Constants
@@ -77,13 +77,13 @@ export function createEmbed(ai: GoogleGenAI, mode: GenaiClient['mode']): GenaiCl
         const { signal } = options;
         const inputs = checkEmbedRequest(request);
         const model = request.model;
-        const sdkModel = mode === 'vertex' ? model.replace(MATCH_GOOGLE_PUBLISHER, '') : model;
+        const sdkModel = toSdkModel(mode, model);
         const { contents, config } = toEmbedCall(request, inputs);
         if (signal?.aborted) {
             return { ok: false, error: { code: 'aborted', message: 'Request aborted', retryable: false } };
         }
-        if (mode === 'vertex' && inputs.length > 1 && isSingleContentVertexModel(sdkModel)) {
-            const message = `Vertex AI embeds one text per call for ${model}; got ${inputs.length}`;
+        const message = embedUnsupported(mode, model, inputs.length);
+        if (message !== undefined) {
             return { ok: false, error: { code: 'unsupported', message, retryable: false } };
         }
         const startedAt = performance.now();
@@ -101,20 +101,24 @@ export function createEmbed(ai: GoogleGenAI, mode: GenaiClient['mode']): GenaiCl
     });
 }
 
-// -------------------------------------------------------------------
-// --- 4. Private Functions
-// -------------------------------------------------------------------
-
-/** Checks if Vertex AI limits model to single content per call (other Gemini/MaaS models route to `embedContent`, `gemini-embedding-001` to `predict`). */
-function isSingleContentVertexModel(model: string): boolean {
-    return (model.includes('gemini') && model !== 'gemini-embedding-001') || model.includes('maas');
+/**
+ * **`unsupported` message of an embed call**: `undefined` if supported.
+ *
+ * - Vertex AI only: multi-text input for non-`gemini-embedding-001` Gemini or `maas` models
+ * - `model` as given in request; `publishers/google/models/` stripped before check
+ */
+export function embedUnsupported(mode: GenaiClient['mode'], model: string, count: number): string | undefined {
+    if (mode === 'vertex' && count > 1 && isSingleContentVertexModel(toSdkModel(mode, model))) {
+        return `Vertex AI embeds one text per call for ${model}; got ${count}`;
+    }
+    return undefined;
 }
 
 /**
  * Validates embedding request and normalizes inputs.
  * @throws {InvalidRequestError} If field, input, task, or dimensions are invalid.
  */
-function checkEmbedRequest(request: GenaiEmbedRequest): EmbedText[] {
+export function checkEmbedRequest(request: GenaiEmbedRequest): EmbedText[] {
     checkOptionKeys(request, REQUEST_KEYS, 'request.');
     if (typeof request.model !== 'string' || request.model === '') {
         throw new InvalidRequestError('Invalid value for option "model"');
@@ -138,35 +142,13 @@ function checkEmbedRequest(request: GenaiEmbedRequest): EmbedText[] {
 }
 
 /**
- * Normalizes single embedding input into text and optional title.
- * @throws {InvalidRequestError} If input is not non-empty text or has invalid title.
- */
-function toEmbedText(input: GenaiEmbedInput, index: number): EmbedText {
-    const option = `input.${index}`;
-    if (typeof input === 'string') {
-        if (input === '') {
-            throw new InvalidRequestError(`Invalid value for option "${option}": a non-empty text`);
-        }
-        return { text: input };
-    }
-    checkOptionKeys(input, INPUT_KEYS, `${option}.`);
-    if (typeof input.text !== 'string' || input.text === '') {
-        throw new InvalidRequestError(`Invalid value for option "${option}.text": a non-empty text`);
-    }
-    if (input.title !== undefined && (typeof input.title !== 'string' || input.title === '')) {
-        throw new InvalidRequestError(`Invalid value for option "${option}.title": a non-empty text`);
-    }
-    return input.title === undefined ? { text: input.text } : { text: input.text, title: input.title };
-}
-
-/**
  * **Contents and config of the SDK call**.
  *
  * - `gemini-embedding-2`: task and titles as text prefixes, no `taskType` or `title` field
  * - other models: `taskType` and the one `title` all inputs share
  * @throws {InvalidRequestError} If inputs of a model with a `title` field have different titles.
  */
-function toEmbedCall(
+export function toEmbedCall(
     request: GenaiEmbedRequest,
     inputs: EmbedText[],
 ): { contents: Content[]; config: EmbedContentConfig } {
@@ -188,6 +170,42 @@ function toEmbedCall(
             ...(title === undefined ? {} : { title }),
         },
     };
+}
+
+// -------------------------------------------------------------------
+// --- 4. Private Functions
+// -------------------------------------------------------------------
+
+/** Model id of the SDK call: Vertex AI without Google publisher prefix. */
+function toSdkModel(mode: GenaiClient['mode'], model: string): string {
+    return mode === 'vertex' ? model.replace(MATCH_GOOGLE_PUBLISHER, '') : model;
+}
+
+/** Checks if Vertex AI limits model to single content per call (other Gemini/MaaS models route to `embedContent`, `gemini-embedding-001` to `predict`). */
+function isSingleContentVertexModel(model: string): boolean {
+    return (model.includes('gemini') && model !== 'gemini-embedding-001') || model.includes('maas');
+}
+
+/**
+ * Normalizes single embedding input into text and optional title.
+ * @throws {InvalidRequestError} If input is not non-empty text or has invalid title.
+ */
+function toEmbedText(input: GenaiEmbedInput, index: number): EmbedText {
+    const option = `input.${index}`;
+    if (typeof input === 'string') {
+        if (input === '') {
+            throw new InvalidRequestError(`Invalid value for option "${option}": a non-empty text`);
+        }
+        return { text: input };
+    }
+    checkOptionKeys(input, INPUT_KEYS, `${option}.`);
+    if (typeof input.text !== 'string' || input.text === '') {
+        throw new InvalidRequestError(`Invalid value for option "${option}.text": a non-empty text`);
+    }
+    if (input.title !== undefined && (typeof input.title !== 'string' || input.title === '')) {
+        throw new InvalidRequestError(`Invalid value for option "${option}.title": a non-empty text`);
+    }
+    return input.title === undefined ? { text: input.text } : { text: input.text, title: input.title };
 }
 
 /** Prepends `gemini-embedding-2` task/title prefix to input text when `taskType` is set. */

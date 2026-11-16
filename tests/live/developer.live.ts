@@ -4,7 +4,7 @@
 // Live: generate, listModels, named models and batch on the Gemini Developer API with the key in env GEMINI_API_KEY.
 // Part of `bun run test:live:key` (with `embed.live.ts` and `decide.live.ts`); never part of `bun test`.
 // Free key: at most 6 requests on gemini-4-hydrogen, 2 on gemini-3.8-flash, 1 on each other model besides
-// gemini-3.1-flash-lite (about 26). Env LIVE_PAID_KEY=1 adds web search and batch (both fail on a free key);
+// gemini-3.1-flash-lite (about 26), plus one embedding and one decision request (mixed named models case). Env LIVE_PAID_KEY=1 adds web search and batch (both fail on a free key);
 // without it those cases are skipped. Env LIVE_SKIP_MODELS=gemini-3.8-flash skips the cases of that model (often
 // overloaded on a free key: HTTP 503/504).
 
@@ -25,11 +25,13 @@ import {
     expectOk,
     generate,
     IS_PAID_KEY,
+    LIVE_LIMITER,
     log,
     REQUEST_TIMEOUT_MS,
     runBatchJob,
     SKIPPED_MODELS,
     send,
+    sendOnce,
     wordMessages,
 } from './shared.js';
 
@@ -114,6 +116,56 @@ describe('Developer API (live, key)', () => {
             it(testCase.name, () => testCase.run(client, LITE), CASE_TIMEOUT_MS);
         }
         it('named models', () => expectNamedModels({ timeoutMs: REQUEST_TIMEOUT_MS }, LITE), CASE_TIMEOUT_MS);
+        it(
+            'named models of all kinds under one shared concurrency, started in parallel',
+            async () => {
+                const gemini = createGenaiModels({
+                    // free-tier flash-lite can hang about 70 s before a 503, holding the shared slot
+                    client: { timeoutMs: 30_000 },
+                    sharedLimits: { concurrency: 1 },
+                    limiterOptions: LIVE_LIMITER,
+                    models: {
+                        lite: { model: LITE, defaults: { reasoning_effort: 'none', temperature: 0, max_tokens: 20 } },
+                        vectors: { kind: 'embed', model: 'gemini-embedding-2', defaults: { dimensions: 128 } },
+                        triage: { kind: 'decide' },
+                    },
+                });
+                const [word, vectors, decision] = await Promise.all([
+                    sendOnce(
+                        'mixed generate',
+                        () => gemini.lite('Reply with the single word: ok'),
+                        (data) => data.text,
+                    ),
+                    sendOnce(
+                        'mixed embed',
+                        () => gemini.vectors('A short sentence.'),
+                        (data) => `${data.embeddings.length} x ${data.embeddings[0]?.length ?? 0}`,
+                    ),
+                    sendOnce(
+                        'mixed decide',
+                        () =>
+                            gemini.triage({
+                                input: 'The sky is blue.',
+                                questions: { color: { type: 'noul', instructions: 'Does the text name a colour?' } },
+                            }),
+                        (data) => JSON.stringify(data.answers),
+                    ),
+                ]);
+                const wordData = expectOk('mixed generate', word);
+                expect(wordData.text.toLowerCase()).toContain('ok');
+                expect(wordData.settings).toMatchObject({ name: 'lite', model: LITE });
+                const vectorsData = expectOk('mixed embed', vectors);
+                expect(vectorsData.embeddings[0]).toHaveLength(128);
+                expect(vectorsData.settings).toEqual({ name: 'vectors', model: 'gemini-embedding-2' });
+                const decisionData = expectOk('mixed decide', decision);
+                expect(decisionData.answers.color.type).toBe('noul');
+                expect(decisionData.settings).toEqual({ name: 'triage', model: 'gemini-decision-1' });
+                for (const attempts of [wordData.attempts, vectorsData.attempts, decisionData.attempts]) {
+                    expect(attempts).toBeGreaterThanOrEqual(1);
+                }
+            },
+            CASE_TIMEOUT_MS,
+        );
     });
 
     describe.skipIf(SKIPPED_MODELS.has(HYDROGEN))(HYDROGEN, () => {

@@ -4,7 +4,7 @@
 // Live (paid): the whole package on Vertex AI. Needs env GOOGLE_CLOUD_PROJECT, VERTEX_BATCH_BUCKET and gcloud
 // application-default credentials; without GOOGLE_CLOUD_PROJECT every case is skipped, without VERTEX_BATCH_BUCKET
 // the batch cases. Run with `bun run test:live:vertex`; never part of `bun test`.
-// 45 generate requests (core cases on three models, breadth on gemini-3.1-flash-lite), 6 embedding requests,
+// 45 generate requests (core cases on three models, breadth on gemini-3.1-flash-lite), 7 embedding requests,
 // one batch job of eight items and one job of two batch calls (each 4 to 6 minutes).
 
 import { describe, expect, it } from 'bun:test';
@@ -26,11 +26,13 @@ import {
     expectNamedModels,
     expectOk,
     generate,
+    LIVE_LIMITER,
     log,
     mask,
     REQUEST_TIMEOUT_MS,
     runBatchJob,
     send,
+    sendOnce,
     wordMessages,
 } from './shared.js';
 
@@ -117,6 +119,17 @@ describe.skipIf(!HAS_PROJECT)('Vertex AI (live, paid)', () => {
         expectError('decide aborted', await vertex().decide(request, { signal: controller.signal }), 'aborted');
     });
 
+    it('named decision model: unsupported without a request, attempts 0', async () => {
+        const gemini = createGenaiModels({
+            client: { vertex: true, timeoutMs: REQUEST_TIMEOUT_MS },
+            models: { triage: { kind: 'decide', modelLimits: { concurrency: 1 } } },
+        });
+        const request = { input: 'x', questions: { q: { type: 'noul', instructions: 'Is it x?' } } } as const;
+        const error = expectError('named decide', await gemini.triage(request), 'unsupported');
+        expect(error.attempts).toBe(0);
+        expect(error.settings).toEqual({ name: 'triage', model: 'gemini-decision-1' });
+    });
+
     for (const model of CORE_MODELS) {
         describe(model, () => {
             for (const testCase of coreCases(['text', 'image', 'reasoning', 'sampling', 'search', 'tools'])) {
@@ -162,6 +175,37 @@ describe.skipIf(!HAS_PROJECT)('Vertex AI (live, paid)', () => {
         it(
             'gemini-embedding-2: one input per call, the query closest to its answer',
             () => expectEmbeddings(vertex(), 'gemini-embedding-2', true),
+            CASE_TIMEOUT_MS,
+        );
+        it(
+            'named gemini-embedding-2: one input, settings and attempts',
+            async () => {
+                const gemini = createGenaiModels({
+                    client: { vertex: true, timeoutMs: REQUEST_TIMEOUT_MS },
+                    limiterOptions: LIVE_LIMITER,
+                    models: {
+                        vectors: {
+                            kind: 'embed',
+                            model: 'gemini-embedding-2',
+                            defaults: { taskType: 'RETRIEVAL_QUERY', dimensions: 256 },
+                            modelLimits: { rpm: 30, concurrency: 1 },
+                        },
+                    },
+                });
+                const label = 'named embed';
+                const data = expectOk(
+                    label,
+                    await sendOnce(
+                        label,
+                        () => gemini.vectors('Which organelle makes ATP?'),
+                        (output) => `${output.embeddings.length} x ${output.embeddings[0]?.length ?? 0}`,
+                    ),
+                );
+                expect(data.embeddings).toHaveLength(1);
+                expect(data.embeddings[0]).toHaveLength(256);
+                expect(data.settings).toEqual({ name: 'vectors', model: 'gemini-embedding-2' });
+                expect(data.attempts).toBeGreaterThanOrEqual(1);
+            },
             CASE_TIMEOUT_MS,
         );
         it(

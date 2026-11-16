@@ -461,8 +461,14 @@ export type GenaiEmbedRequest = {
     dimensions?: number;
 };
 
-/** Vectors of an embedding request, in input order. */
-export type GenaiEmbedOutput = { embeddings: number[][]; model: string; ms: number };
+/** Vectors of an embedding request, in input order; `settings` (`name`, `model`) and `attempts` only from named models. */
+export type GenaiEmbedOutput = {
+    embeddings: number[][];
+    model: string;
+    ms: number;
+    settings?: GenaiSettings;
+    attempts?: number;
+};
 
 /** Decision question instructions: text, text part, or text part list. */
 export type GenaiDecideInstructions = string | GenaiTextPart | readonly GenaiTextPart[];
@@ -571,12 +577,15 @@ export type GenaiDecideAnswerOf<T extends GenaiDecideQuestion> = T extends { typ
  *
  * - `answers`: one answer per question key
  * - `usage`: `total_input_tokens` and `total_output_tokens` (always 0) of the response
+ * - `settings` (`name`, `model`) and `attempts`: only from named models
  */
 export type GenaiDecideOutput<Q extends GenaiDecideQuestions = GenaiDecideQuestions> = {
     answers: { -readonly [K in keyof Q]: GenaiDecideAnswerOf<Q[K]> };
     usage: { inputTokens: number | null; outputTokens: number | null };
     model: string;
     ms: number;
+    settings?: GenaiSettings;
+    attempts?: number;
 };
 
 /**
@@ -600,10 +609,10 @@ export type GenaiModelInfo = {
  * **Rate limiting rules**: configured via smart-limit buckets.
  *
  * - `concurrency`: maximum concurrent synchronous requests in flight; batch calls (`batch: true`) not capped
- * - `rps` / `rpm` / `rpd`: request counts per second, minute, or day
+ * - `rps` / `rpm` / `rpd`: request counts per second, minute, or day; embed call: one request per input text
  * - `tpm` / `tpd`: token limits per minute or day
- * - `intervalMs`: minimum delay between consecutive request starts
- * - `buckets`: custom smart-limit bucket instances
+ * - `intervalMs`: minimum delay between consecutive request starts; per call
+ * - `buckets`: custom smart-limit bucket instances; embed call books `requests` per input text
  */
 export type GenaiLimits = {
     concurrency?: number;
@@ -625,18 +634,75 @@ export type GenaiLimiterOptions = {
     maxWaitMs?: number;
 };
 
-/** Configuration spec for named model. */
+/** Configuration spec for named generation model; `kind` optional. */
 export type GenaiModelSpec = {
+    kind?: 'generate';
     model: string;
     defaults?: Omit<GenaiDefaults, 'model'>;
     modelLimits?: GenaiLimits;
     charsPerToken?: number;
 };
 
-/** Configuration options for `createGenaiModels`. */
-export type GenaiModelsOptions<N extends string> = {
+/** Defaults of named embedding model. */
+export type GenaiEmbedDefaults = { taskType?: GenaiEmbedTask; dimensions?: number };
+
+/** Configuration spec for named embedding model; top-level generation `defaults` not applied. */
+export type GenaiEmbedModelSpec = {
+    kind: 'embed';
+    model: string;
+    defaults?: GenaiEmbedDefaults;
+    modelLimits?: GenaiLimits;
+    charsPerToken?: number;
+};
+
+/** Configuration spec for named decision model; `model` default `gemini-decision-1`; no `defaults`. */
+export type GenaiDecideModelSpec = {
+    kind: 'decide';
+    model?: string;
+    modelLimits?: GenaiLimits;
+    charsPerToken?: number;
+};
+
+/** Configuration spec of any named model kind. */
+export type GenaiAnyModelSpec = GenaiModelSpec | GenaiEmbedModelSpec | GenaiDecideModelSpec;
+
+/** Spec type of one `models` entry by its `kind`. */
+type GenaiSpecOf<S> = S extends { kind: 'embed' }
+    ? GenaiEmbedModelSpec
+    : S extends { kind: 'decide' }
+      ? GenaiDecideModelSpec
+      : GenaiModelSpec;
+
+/** Maps keys of `V` missing in `T` to `never`, others to `unknown`. */
+type GenaiKnownKeys<V, T> = { [K in keyof V]: K extends keyof T ? unknown : never };
+
+/**
+ * **Key check of `models` entries**: intersected with inferred record.
+ *
+ * - unknown spec keys → `never`, against spec of entry `kind`
+ * - one level into `defaults` and `modelLimits`; values checked by `createGenaiModels` constraint
+ */
+type GenaiModelsCheck<M> = {
+    [N in keyof M]: M[N] extends string
+        ? unknown
+        : {
+              [K in keyof M[N]]: K extends keyof GenaiSpecOf<M[N]>
+                  ? K extends 'defaults' | 'modelLimits'
+                      ? GenaiKnownKeys<M[N][K], NonNullable<GenaiSpecOf<M[N]>[K]>>
+                      : unknown
+                  : never;
+          };
+};
+
+/** `models` of `createGenaiModels`: record of entries, or name union for generation entries only. */
+type GenaiModelsEntries<M extends string | Readonly<Record<string, string | GenaiAnyModelSpec>>> = [M] extends [string]
+    ? Readonly<Record<NoInfer<M> & string, string | GenaiModelSpec>>
+    : M & NoInfer<GenaiModelsCheck<M>>;
+
+/** Configuration options for `createGenaiModels`; `M`: `models` record, or name union (all generation models). */
+export type GenaiModelsOptions<M extends string | Readonly<Record<string, string | GenaiAnyModelSpec>>> = {
     client?: Omit<GenaiClientOptions, 'defaults'>;
-    models: Readonly<Record<N, string | GenaiModelSpec>>;
+    models: GenaiModelsEntries<M>;
     defaults?: Omit<GenaiDefaults, 'model'>;
     sharedLimits?: GenaiLimits;
     limiterOptions?: GenaiLimiterOptions;
@@ -678,12 +744,51 @@ export type GenaiModelBatch = {
     cancel(name: string, options?: { signal?: AbortSignal }): Promise<Result<void, GenaiError>>;
 };
 
+/** Call options for named embedding model; `undefined` keeps the default. */
+export type GenaiEmbedModelOptions = {
+    taskType?: GenaiEmbedTask | undefined;
+    dimensions?: number | undefined;
+    signal?: AbortSignal;
+};
+
+/** Named embedding model caller function: one `embed` call per input list, through limiter queue; no `batch`. */
+export type GenaiEmbedModel = {
+    (
+        input: string | readonly GenaiEmbedInput[],
+        options?: GenaiEmbedModelOptions,
+    ): Promise<Result<GenaiEmbedOutput, GenaiError>>;
+    readonly id: string;
+};
+
+/** Named decision model caller function: one `decide` call per request, through limiter queue; no `batch`. */
+export type GenaiDecideModel = {
+    <const Q extends GenaiDecideQuestions>(
+        request: Omit<GenaiDecideRequest<Q>, 'model'>,
+        options?: { signal?: AbortSignal },
+    ): Promise<Result<GenaiDecideOutput<Q>, GenaiError>>;
+    readonly id: string;
+};
+
 /** Property names reserved on `createGenaiModels` result object. */
 // biome-ignore lint/complexity/noBannedTypes: keyof Object gets the methods of Object.prototype
 export type GenaiReservedName = 'client' | 'listModels' | 'then' | 'toJSON' | '__proto__' | keyof Object;
 
+/** Model function of one `models` entry by its `kind`. */
+type GenaiModelOf<S> = S extends { kind: 'embed' }
+    ? GenaiEmbedModel
+    : S extends { kind: 'decide' }
+      ? GenaiDecideModel
+      : GenaiModel;
+
+/** Model functions by name: all `GenaiModel` for name union, else per entry `kind`. */
+type GenaiModelMembers<M> = [M] extends [string]
+    ? Record<M & string, GenaiModel>
+    : { [K in keyof M]: GenaiModelOf<M[K]> };
+
 /** Object mapping model names to callable model functions, plus `client` and `listModels`. */
-export type GenaiModels<N extends string> = { readonly [K in Exclude<N, GenaiReservedName>]: GenaiModel } & {
+export type GenaiModels<M extends string | Readonly<Record<string, string | GenaiAnyModelSpec>>> = {
+    readonly [K in Exclude<keyof GenaiModelMembers<M>, GenaiReservedName>]: GenaiModelMembers<M>[K];
+} & {
     readonly client: GenaiClient;
     listModels: GenaiClient['listModels'];
 };

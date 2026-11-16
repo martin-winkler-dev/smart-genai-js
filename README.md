@@ -163,7 +163,8 @@ const vectors = await studio.embed({
   - For `gemini-embedding-2*`, `smart-genai` applies documented text prefixes (`title: <title or none> | text: <text>` for `RETRIEVAL_DOCUMENT`; `task: <name> | query: <text>` for other tasks) instead of API `taskType`/`title` fields.
   - Other models (e.g. `gemini-embedding-001`) receive API `taskType` and `title` fields, and all inputs in one call must share the same `title`. (`gemini-embedding-001` returns normalized vectors only at 3072 dimensions.)
 - **Vertex AI**: `publishers/google/models/` prefix is stripped before the SDK call. `gemini-embedding-001` supports up to 100 inputs per call (`predict`); other Gemini models (e.g. `gemini-embedding-2`) and `maas` models support only 1 text per call (`> 1` returns `unsupported`).
-- **Output**: `{ embeddings: number[][], model, ms }` (no token usage). Returns `unexpected` if vector count mismatches or any vector is empty.
+- **Output**: `{ embeddings: number[][], model, ms }` (no token usage), plus `settings` and `attempts` only from [named models](#named-models). Returns `unexpected` if vector count mismatches or any vector is empty.
+- **Limits & retries**: `client.embed` (also `gemini.client.embed`) sends one request per call without rate limits or retries. For both, use a `kind: 'embed'` entry in [named models](#named-models).
 
 ## Decisions (`gemini-decision-1`)
 
@@ -197,8 +198,9 @@ if (decision.ok) {
 }
 ```
 
-- **Developer API only**: returns `unsupported` on Vertex AI without sending a request. Not included on named-model wrappers; call `gemini.client.decide(...)`.
-- **Model & options**: `model` defaults to `DEFAULT_DECIDE_MODEL` (`'gemini-decision-1'`). Client `defaults` do not apply. Options: `{ signal }`; no automatic retries.
+- **Developer API only**: returns `unsupported` on Vertex AI without sending a request.
+- **Model & options**: `model` defaults to `DEFAULT_DECIDE_MODEL` (`'gemini-decision-1'`). Client `defaults` do not apply. Options: `{ signal }`.
+- **Limits & retries**: `client.decide` (also `gemini.client.decide`) sends one request per call without rate limits or retries. For both, use a `kind: 'decide'` entry in [named models](#named-models).
 - **Questions**: 1 to 1000 (`MAX_DECIDE_QUESTIONS`), keys 1–64 chars matching `[A-Za-z0-9_-]`. `instructions` accepts non-empty string, `{ type: 'text', text }`, or non-empty array of `{ type: 'text', text }`:
   - `noul`: yes/no (`criteria` optional: `{ true_description?, false_description? }`). Answer: `{ type: 'noul', noul, confidence }`.
   - `choice`: `criteria` maps 2–255 non-empty option IDs (no leading/trailing whitespace or control chars) to descriptions (`''` allowed). Answer: `{ type: 'choice', choice, probabilities, confidence }`. With literal `questions`, `choice` and `probabilities` are strictly typed by option IDs (numeric keys as strings).
@@ -207,7 +209,7 @@ if (decision.ok) {
   - Chat parts: `{ type: 'text', text }` and `{ type: 'image_url', image_url: { url: 'data:image/png;base64,...' } }` (`detail` ignored; converted to `image` block).
   - Media blocks: `image`, `audio`, `video`, `document` with `mime_type` and exactly one of `data` (base64) or `uri`, plus optional `resolution` (`'low' | 'medium' | 'high'` on `image` and `video`; `'ultra_high'` on `image` only).
 - **API limits**: 262,144 input tokens per request; inline base64 up to 100 MB (50 MB for PDF); external URIs up to 15 MB; no YouTube or `gs://` URLs; no batch, caching, or tools.
-- **Result**: `data` has `answers`, `usage` (`inputTokens`, `outputTokens`), `model`, and `ms`. Safety blocks map to `blocked`; missing or mismatched answer types map to `unexpected`.
+- **Result**: `data` has `answers`, `usage` (`inputTokens`, `outputTokens`), `model`, and `ms`, plus `settings` and `attempts` only from [named models](#named-models). Safety blocks map to `blocked`; missing or mismatched answer types map to `unexpected`.
 
 ## Named models
 
@@ -228,6 +230,8 @@ const gemini = createGenaiModels({
         lite: { model: 'gemini-3.5-flash-lite', modelLimits: { intervalMs: 3000 } },
         flash: 'gemini-3.8-flash', // string shorthand for { model }
         flashBatch: { model: 'gemini-3.8-flash', defaults: { batch: true } },
+        docs: { kind: 'embed', model: 'gemini-embedding-2', defaults: { taskType: 'RETRIEVAL_DOCUMENT' } },
+        judge: { kind: 'decide' }, // model defaults to 'gemini-decision-1'
     },
 });
 
@@ -235,19 +239,29 @@ await gemini.flash38('Summarize this abstract: ...');
 await gemini.lite(messages, { web_search: true, reasoning_effort: 'none' });
 gemini.flash38.id; // 'gemini-3.8-flash'
 await gemini.flash38.batch?.submit([{ key: 'a', request: { messages } }]);
+await gemini.docs(['First paragraph.', { text: 'Second paragraph.', title: 'Intro' }], { dimensions: 768 });
+await gemini.judge({ input: 'My order is late again.', questions: { angry: { type: 'noul', instructions: 'Is the customer angry?' } } });
 await gemini.listModels();
 ```
 
+- **Entry kinds**: `kind` omitted or `'generate'`: generation model (`{ model, defaults?, modelLimits?, charsPerToken? }` or string shorthand). `'embed'`: embedding model (`{ kind, model, defaults?: { taskType?, dimensions? }, modelLimits?, charsPerToken? }`). `'decide'`: decision model (`{ kind, model?, modelLimits?, charsPerToken? }`; `model` defaults to `'gemini-decision-1'`; no `defaults`). Top-level `defaults` apply to generation entries only. Unknown keys or invalid embed defaults throw `TypeError` at creation.
 - **Calling convention**: `gemini.<name>(input, options?)`. `input` is a `string`, non-empty `GenaiContentPart[]` (single user turn), or non-empty `GenaiMessage[]`. `options` accepts any `GenaiRequest` field except `model` and `messages`, plus `signal` and `config` (explicit `undefined` preserves defaults). Returned functions are `this`-independent.
-- **Properties & naming**: exposes `gemini.client`, `gemini.listModels`, and each model function (with `.id` and optional `.batch`). Model names not valid as JS identifiers use bracket notation (`gemini['flash-lite']`). Reserved names (`client`, `listModels`, `then`, `toJSON`, `__proto__`, and `Object.prototype` keys) throw `TypeError`. Passing a `GenaiClient` instance or `client.defaults` to `createGenaiModels`, setting `model` in defaults, or passing `model`/`messages` in call `options` is rejected (`TypeError` at creation, `invalid_request` at call time).
-- **Defaults hierarchy**: top-level `defaults` < `models.<name>.defaults` < per-call `options`.
-- **Traceability**: `settings` includes `name: '<key>'`; `attempts` reports total API attempts (`0` if rejected before dispatch).
-- **Rate limiting (`sharedLimits` & `modelLimits`)**: powered by `smart-limit`. Both accept `concurrency`, `rps`, `rpm`, `rpd`, `tpm`, `tpd`, `intervalMs` (all positive integers `>= 1`), and custom `buckets` (`Bucket[]`). `sharedLimits` applies across all models in the instance; `modelLimits` applies per model. Synchronous calls must acquire capacity from both.
+  - Embedding: `gemini.<name>(input, { taskType?, dimensions?, signal? })` with `input` as in [Embeddings](#embeddings); call options override entry `defaults` (explicit `undefined` keeps the default).
+  - Decision: `gemini.<name>({ input, questions }, { signal? })`; answers are typed by `questions` as in [Decisions](#decisions-gemini-decision-1). `model` in the request returns `invalid_request`.
+- **Properties & naming**: exposes `gemini.client`, `gemini.listModels`, and each model function (with `.id`; `.batch` only on generation models when the client has batch). Model names not valid as JS identifiers use bracket notation (`gemini['flash-lite']`). Reserved names (`client`, `listModels`, `then`, `toJSON`, `__proto__`, and `Object.prototype` keys) throw `TypeError`. Passing a `GenaiClient` instance or `client.defaults` to `createGenaiModels`, setting `model` in defaults, or passing `model`/`messages` in call `options` is rejected (`TypeError` at creation, `invalid_request` at call time).
+- **Defaults hierarchy**: top-level `defaults` < `models.<name>.defaults` < per-call `options` (embedding entries: `models.<name>.defaults` < per-call `options`).
+- **Traceability**: `settings` includes `name: '<key>'` (embedding and decision results: `settings: { name, model }`); `attempts` reports total API attempts (`0` if rejected before dispatch).
+- **Checks before queueing (embedding & decision)**: an invalid request returns `invalid_request` without `settings` and `attempts`. An already aborted `signal` (`aborted`) and unsupported cases (`unsupported`: decision on Vertex AI, more than one embedding input on Vertex models that take 1 text per call) return `settings` and `attempts: 0`. None of these book capacity.
+- **Rate limiting (`sharedLimits` & `modelLimits`)**: powered by `smart-limit`. Both accept `concurrency`, `rps`, `rpm`, `rpd`, `tpm`, `tpd`, `intervalMs` (all positive integers `>= 1`), and custom `buckets` (`Bucket[]`). `sharedLimits` applies across all models of all kinds in the instance, so a shared `tpm`/`tpd` is one budget for generation, embedding and decision tokens; use `modelLimits` for per-model quotas. Synchronous calls must acquire capacity from both.
+  - Embedding: each input text counts as one request for `rps`, `rpm`, `rpd` and custom `buckets`, as the Gemini API counts them; `intervalMs` and `concurrency` count per call. A call with more inputs than such a limit returns `code: 'limiter'` with `limiterCode: 'COST_EXCEEDS_LIMIT'`.
 - **Retry & backoff (`limiterOptions`)**: active even without limits configured. Defaults: `maxRetries: 4`, `retryDelayMs: 2000`, `maxRetryDelayMs: 300000`, `maxWaitMs: 900000` (`Infinity` allowed for `maxWaitMs`).
   - Timeouts, HTTP `408`/`409`/`425`, and `MALFORMED_FUNCTION_CALL` retry per call up to `maxRetries`.
-  - HTTP `429`, `5xx`, and `network` errors trigger a per-model queue lock (`backoff_global`, using `retryAfterMs` or exponential backoff with a `1000` ms minimum) up to `maxWaitMs` without consuming `maxRetries`, followed by a single probe call before resuming queued calls.
+  - HTTP `429`, `5xx`, and `network` errors trigger a queue lock of that model only (`backoff_global`, using `retryAfterMs` or exponential backoff with a `1000` ms minimum) up to `maxWaitMs` without consuming `maxRetries`, followed by a single probe call before resuming queued calls.
   - Calls failing before any attempt return `code: 'limiter'` with `limiterCode` (`COST_EXCEEDS_LIMIT`, `MAX_WAIT_EXCEEDED`); calls failing after at least one attempt return the last provider `GenaiError`.
-- **Token reservation & `charsPerToken`**: when `tpm` or `tpd` is configured, each call reserves `Math.ceil(chars / charsPerToken) + 1120 * images + (max_tokens ?? max_completion_tokens ?? 1000)` tokens and settles against actual reported usage (`0` if `429` without usage). `charsPerToken` defaults to `4` (any positive finite number) and can be set globally or per model.
+- **Token reservation & `charsPerToken`**: when `tpm` or `tpd` is configured, each call reserves tokens per kind. `charsPerToken` defaults to `4` (any positive finite number) and can be set globally or per model.
+  - Generation: `Math.ceil(chars / charsPerToken) + 1120 * images + (max_tokens ?? max_completion_tokens ?? 1000)`, settled against actual reported usage (`0` if `429` without usage).
+  - Embedding: `Math.ceil((text + title chars) / charsPerToken)`; no settlement (no usage reported); refunded on `429`.
+  - Decision: `Math.ceil(chars / charsPerToken) + 1120` per non-text input part, with chars of input text, instructions and criteria texts (including choice IDs); settled against reported input + output tokens; refunded on `429`.
 - **Batch on named models**: `gemini.<name>.batch` omits `list` and `removeFiles` (use `gemini.client.batch`). Batch calls (`batch: true`) run in a separate queue per model without `concurrency` or rate/token buckets; `limiterOptions` and `signal` still apply. Calls exceeding `maxBytes` fail pre-enqueue with `invalid_request`.
 
 ## Batch

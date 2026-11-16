@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Live: Decisions API (`gemini-decision-1`) on the Gemini Developer API with the free key in env GEMINI_API_KEY.
-// Run with `bun run test:live:decide`, also part of `bun run test:live:key`; never part of `bun test`. Sends 9 requests.
+// Run with `bun run test:live:decide`, also part of `bun run test:live:key`; never part of `bun test`. Sends 10 requests.
 
 import { describe, expect, it } from 'bun:test';
-import { createGenaiClient } from '../../src/index.js';
+import { createGenaiClient, createGenaiModels } from '../../src/index.js';
 
 // -------------------------------------------------------------------
 // --- 1. Constants
@@ -155,6 +155,42 @@ describe('Gemini Decisions API (live, free key)', () => {
             expect(broken.noul).toBeGreaterThan(0.5);
             expect(tier.choice).toBe('2');
             expect(Object.keys(tier.probabilities).sort()).toEqual(['1', '2']);
+        },
+        TIMEOUT_MS,
+    );
+
+    it(
+        'named decision model: typed answers, usage, settings and attempts',
+        async () => {
+            const gemini = createGenaiModels({
+                client: { ...(apiKey === undefined ? {} : { apiKey }), timeoutMs: 30_000 },
+                limiterOptions: { maxRetries: 3, maxWaitMs: 30_000 },
+                models: { triage: { kind: 'decide', modelLimits: { rpm: 10, tpm: 20_000, concurrency: 1 } } },
+            });
+            expect(gemini.triage.id).toBe('gemini-decision-1');
+            const result = await gemini.triage({
+                input: 'The mug arrived cracked. I want my money back.',
+                questions: {
+                    damaged: DAMAGED,
+                    intent: {
+                        type: 'choice',
+                        instructions: 'What does the customer want?',
+                        criteria: { refund: 'Money back', exchange: 'Another item' },
+                    },
+                },
+            });
+            console.log(JSON.stringify(result));
+            expect(result.ok).toBe(true);
+            if (!result.ok) {
+                return;
+            }
+            const { damaged, intent } = result.data.answers;
+            expect(damaged.noul).toBeGreaterThan(0.5);
+            const choice: 'refund' | 'exchange' = intent.choice;
+            expect(choice).toBe('refund');
+            expect(result.data.usage.inputTokens).toBeGreaterThan(0);
+            expect(result.data.settings).toEqual({ name: 'triage', model: 'gemini-decision-1' });
+            expect(result.data.attempts).toBeGreaterThanOrEqual(1);
         },
         TIMEOUT_MS,
     );

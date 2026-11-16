@@ -4,6 +4,7 @@
 import type { GenerateContentConfig } from '@google/genai';
 import {
     createGenaiClient,
+    createGenaiModels,
     type DEFAULT_DECIDE_MODEL,
     type GenaiBatchCheckOptions,
     type GenaiBatchJob,
@@ -14,6 +15,7 @@ import {
     type GenaiDecideInputPart,
     type GenaiDecideInstructions,
     type GenaiDecideMediaPart,
+    type GenaiDecideModel,
     type GenaiDecideNoulAnswer,
     type GenaiDecideNoulQuestion,
     type GenaiDecideOutput,
@@ -22,9 +24,15 @@ import {
     type GenaiDecideRequest,
     type GenaiDecideScoreAnswer,
     type GenaiDecideScoreQuestion,
+    type GenaiEmbedModel,
+    type GenaiEmbedOutput,
     type GenaiError,
+    type GenaiModel,
+    type GenaiModels,
+    type GenaiModelsOptions,
     type GenaiOutput,
     type GenaiRequest,
+    type GenaiSettings,
     type MAX_DECIDE_QUESTIONS,
     mergeGenaiConfig,
     type Result,
@@ -148,3 +156,98 @@ const _literalAnswer: Equal<
 > = true;
 const _noulAnswer: Equal<GenaiDecideAnswerOf<typeof _noulQuestion>, GenaiDecideNoulAnswer> = true;
 const _scoreAnswer: Equal<GenaiDecideAnswerOf<typeof _scoreQuestion>, GenaiDecideScoreAnswer> = true;
+
+const mixed = createGenaiModels({
+    client: { apiKey: 'k' },
+    defaults: { temperature: 0 },
+    models: {
+        flash: 'gemini-x',
+        pro: { model: 'gemini-y', defaults: { stop: ['END'], tools: [{ type: 'function', function: { name: 'f' } }] } },
+        generate: { kind: 'generate', model: 'gemini-z' },
+        embed: {
+            kind: 'embed',
+            model: 'gemini-embedding-2',
+            defaults: { taskType: 'RETRIEVAL_DOCUMENT', dimensions: 8 },
+        },
+        decide: { kind: 'decide', modelLimits: { rpm: 60 } },
+        decideOwn: { kind: 'decide', model: 'models/gemini-decision-1', charsPerToken: 3 },
+    },
+});
+const _flashModel: Equal<typeof mixed.flash, GenaiModel> = true;
+const _proModel: Equal<typeof mixed.pro, GenaiModel> = true;
+const _generateModel: Equal<typeof mixed.generate, GenaiModel> = true;
+const _embedModel: Equal<typeof mixed.embed, GenaiEmbedModel> = true;
+const _embedId: string = mixed.embed.id;
+const _embedded: Promise<Result<GenaiEmbedOutput, GenaiError>> = mixed.embed(['a', { text: 'b', title: 't' }], {
+    taskType: undefined,
+    dimensions: 4,
+});
+// @ts-expect-error: no batch on embedding models
+mixed.embed.batch;
+// @ts-expect-error: model is fixed by the name
+mixed.embed('a', { model: 'other' });
+createGenaiModels({
+    // @ts-expect-error: generation defaults on an embedding spec
+    models: { embed: { kind: 'embed', model: 'm', defaults: { temperature: 0 } } },
+});
+createGenaiModels({
+    models: {
+        // @ts-expect-error: typo key in a generate spec
+        a: { model: 'm', modelLimit: { rpm: 1 } },
+        // @ts-expect-error: typo key in an embed spec
+        b: { kind: 'embed', model: 'm', defaultz: {} },
+    },
+});
+createGenaiModels({
+    models: {
+        // @ts-expect-error: typo key in generate defaults
+        a: { model: 'm', defaults: { temperature: 0, temprature: 0 } },
+        // @ts-expect-error: typo key in embed defaults
+        b: { kind: 'embed', model: 'm', defaults: { dimensions: 8, dimension: 8 } },
+        // @ts-expect-error: typo key in modelLimits
+        c: { model: 'm', modelLimits: { rpm: 1, rmp: 1 } },
+    },
+});
+const _decideModel: Equal<typeof mixed.decide, GenaiDecideModel> = true;
+const _decideOwnModel: Equal<typeof mixed.decideOwn, GenaiDecideModel> = true;
+const _decideId: string = mixed.decide.id;
+const namedDecided = await mixed.decide(
+    {
+        input: 'The mug arrived cracked.',
+        questions: {
+            damaged: { type: 'noul', instructions: 'Damaged?' },
+            intent: { type: 'choice', instructions: 'Intent?', criteria: { refund: '', exchange: '' } },
+            anger: { type: 'score', instructions: 'How angry?', criteria: ['calm', 'furious'] },
+        },
+    },
+    { signal: new AbortController().signal },
+);
+if (namedDecided.ok) {
+    const { damaged, intent, anger } = namedDecided.data.answers;
+    const _namedNoul: Equal<typeof damaged, GenaiDecideNoulAnswer> = true;
+    const _namedChoice: Equal<typeof intent.choice, 'refund' | 'exchange'> = true;
+    const _namedScore: Equal<typeof anger, GenaiDecideScoreAnswer> = true;
+    const _namedSettings: GenaiSettings | undefined = namedDecided.data.settings;
+    const _namedAttempts: number | undefined = namedDecided.data.attempts;
+    // @ts-expect-error: only the asked question keys exist
+    namedDecided.data.answers.other;
+}
+// @ts-expect-error: no batch on decision models
+mixed.decide.batch;
+// @ts-expect-error: model is fixed by the name
+mixed.decide({ model: 'other', input: 'x', questions: { a: { type: 'noul', instructions: 'i' } } });
+createGenaiModels({
+    models: {
+        // @ts-expect-error: no defaults on a decide spec
+        d: { kind: 'decide', defaults: {} },
+    },
+});
+createGenaiModels({
+    models: {
+        // @ts-expect-error: typo key in a decide spec
+        d: { kind: 'decide', modelLimit: { rpm: 1 } },
+    },
+});
+const unionOptions: GenaiModelsOptions<'a' | 'b'> = { models: { a: 'm', b: { model: 'n' } } };
+const unionModels: GenaiModels<'a' | 'b'> = createGenaiModels(unionOptions);
+const _unionMembers: Equal<[typeof unionModels.a, typeof unionModels.b], [GenaiModel, GenaiModel]> = true;

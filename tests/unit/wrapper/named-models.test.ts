@@ -3,7 +3,7 @@
 
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'bun:test';
 import { ThinkingLevel } from '@google/genai';
-import { createRPM } from 'smart-limit';
+import { type Bucket, type Cost, createRPM } from 'smart-limit';
 import { batchTiming } from '../../../src/core/batch/calls.js';
 import { createGenaiClient } from '../../../src/core/client.js';
 import { assistantMessage, toolMessage } from '../../../src/core/messages.js';
@@ -12,21 +12,28 @@ import { createGenaiModels } from '../../../src/wrapper/named-models.js';
 import {
     apiError,
     batchResponse,
+    decisionError,
+    decisionsReply,
+    type GeminiReply,
+    type GeminiRequest,
     generateBody,
     generateResponse,
     sentBatch,
     sentConfig,
     startFakeGemini,
 } from '../fake-gemini.js';
+import { fakeAuthClient, startFakeVertex } from '../fake-vertex.js';
 
 // -------------------------------------------------------------------
 // --- 1. Constants
 // -------------------------------------------------------------------
 
 const server = startFakeGemini();
+const vertexServer = startFakeVertex();
 
 afterAll(() => {
     server.stop();
+    vertexServer.stop();
 });
 beforeEach(() => {
     server.received.length = 0;
@@ -1179,5 +1186,976 @@ describe('batch calls of named models', () => {
                 { key: '1', request: { messages: [{ role: 'user', content: 'x' }] } },
             ]),
         ).toMatchObject({ ok: true, data: { name: 'batches/b1' } });
+    });
+});
+
+describe('embedding models', () => {
+    /** Answers embed calls with one vector `[n]` per input (n from 1), other calls with text. */
+    function embedReply(request: GeminiRequest): Response {
+        if (!request.path.endsWith(':batchEmbedContents')) {
+            return generateResponse('ok');
+        }
+        const requests = (request.body?.requests ?? []) as unknown[];
+        return Response.json({ embeddings: requests.map((_, index) => ({ values: [index + 1] })) });
+    }
+
+    beforeEach(() => {
+        vertexServer.received.length = 0;
+        server.reply(embedReply);
+    });
+
+    /** Request entries of the received embed call at index. */
+    function sentEmbeds(index: number): unknown {
+        return server.received[index]?.body?.requests;
+    }
+
+    /** Configures fake server delaying calls by callMs, recording texts and running calls; errors answer first. */
+    function embedServer(callMs = 0, errors: Response[] = []) {
+        const texts: string[] = [];
+        const runningAtStart: number[] = [];
+        let running = 0;
+        server.reply(async (request) => {
+            const requests = (request.body?.requests ?? []) as { content: { parts: { text: string }[] } }[];
+            texts.push(requests.map((entry) => entry.content.parts[0]?.text).join(','));
+            runningAtStart.push(running);
+            running++;
+            await Bun.sleep(callMs);
+            running--;
+            return errors.shift() ?? embedReply(request);
+        });
+        return { texts, runningAtStart };
+    }
+
+    /** Vertex AI client options for fake Vertex server. */
+    function vertexOptions(): GenaiClientOptions {
+        return { vertex: { project: 'p', authClient: fakeAuthClient() }, baseUrl: vertexServer.baseUrl, env: {} };
+    }
+
+    it('throw for invalid embedding specs at creation', () => {
+        const client = clientOptions();
+        const invalid: [unknown, RegExp][] = [
+            [{ kind: 'other', model: 'm' }, /^Invalid value for option "models\.e\.kind"$/],
+            [{ kind: 1, model: 'm' }, /^Invalid value for option "models\.e\.kind"$/],
+            [{ kind: 'embed', model: 'm', limit: {} }, /^Option "models\.e\.limit" is not supported$/],
+            [{ kind: 'embed', model: '' }, /^Invalid value for option "models\.e\.model"$/],
+            [{ kind: 'embed' }, /^Invalid value for option "models\.e\.model"$/],
+            [{ kind: 'embed', model: 'm', defaults: null }, /^Invalid value for option "models\.e\.defaults"$/],
+            [{ kind: 'embed', model: 'm', defaults: [] }, /^Invalid value for option "models\.e\.defaults"$/],
+            [{ kind: 'embed', model: 'm', defaults: 'x' }, /^Invalid value for option "models\.e\.defaults"$/],
+            [
+                { kind: 'embed', model: 'm', defaults: { temperature: 0 } },
+                /^Option "models\.e\.defaults\.temperature" is not supported$/,
+            ],
+            [
+                { kind: 'embed', model: 'm', defaults: { taskType: 'NOPE' } },
+                /^Invalid value for option "models\.e\.defaults": Invalid value for option "taskType"$/,
+            ],
+            [
+                { kind: 'embed', model: 'm', defaults: { dimensions: 0 } },
+                /^Invalid value for option "models\.e\.defaults": Invalid value for option "dimensions"/,
+            ],
+            [{ kind: 'embed', model: 'm', charsPerToken: 0 }, /^Invalid value for option "models\.e\.charsPerToken"$/],
+            [
+                { kind: 'embed', model: 'm', modelLimits: { rpm: 0 } },
+                /^Invalid value for option "models\.e\.modelLimits\.rpm"$/,
+            ],
+        ];
+        for (const [spec, message] of invalid) {
+            function create() {
+                return createGenaiModels({ client, models: { e: spec } } as never);
+            }
+            expect(create).toThrow(message);
+            expect(create).toThrow(TypeError);
+        }
+    });
+
+    it('embed string and array input with the model id, own defaults and per-call options', async () => {
+        const gemini = createGenaiModels({
+            client: clientOptions(),
+            defaults: { temperature: 0.5, stop: ['END'] },
+            models: {
+                embed: {
+                    kind: 'embed',
+                    model: 'gemini-embedding-001',
+                    defaults: { taskType: 'RETRIEVAL_DOCUMENT', dimensions: 8 },
+                },
+            },
+        });
+        const settings = { name: 'embed', model: 'gemini-embedding-001' };
+        expect(await gemini.embed('one')).toEqual({
+            ok: true,
+            data: { embeddings: [[1]], model: 'gemini-embedding-001', ms: expect.any(Number), settings, attempts: 1 },
+        });
+        expect(server.received[0]?.path).toBe('/v1beta/models/gemini-embedding-001:batchEmbedContents');
+        // own defaults only: no generation defaults of the instance
+        expect(sentEmbeds(0)).toEqual([
+            {
+                model: 'models/gemini-embedding-001',
+                content: { role: 'user', parts: [{ text: 'one' }] },
+                taskType: 'RETRIEVAL_DOCUMENT',
+                outputDimensionality: 8,
+            },
+        ]);
+        expect(await gemini.embed(['a', 'b'], { taskType: 'CLUSTERING', dimensions: undefined })).toMatchObject({
+            ok: true,
+            data: { embeddings: [[1], [2]], settings, attempts: 1 },
+        });
+        expect(sentEmbeds(1)).toMatchObject([
+            { taskType: 'CLUSTERING', outputDimensionality: 8 },
+            { taskType: 'CLUSTERING', outputDimensionality: 8 },
+        ]);
+        await gemini.embed([{ text: 'c', title: 'T' }], { taskType: undefined, dimensions: 4 });
+        expect(sentEmbeds(2)).toMatchObject([{ taskType: 'RETRIEVAL_DOCUMENT', title: 'T', outputDimensionality: 4 }]);
+    });
+
+    it('have an id, no batch, and work without this', async () => {
+        const gemini = createGenaiModels({
+            client: clientOptions(),
+            models: { embed: { kind: 'embed', model: 'gemini-embedding-001' } },
+        });
+        expect(gemini.embed.id).toBe('gemini-embedding-001');
+        expect(Object.keys(gemini.embed)).toEqual(['id']);
+        expect('batch' in gemini.embed).toBe(false);
+        const { embed } = gemini;
+        expect(await embed('x')).toMatchObject({ ok: true });
+        expect(await embed.call(undefined, 'y')).toMatchObject({ ok: true });
+    });
+
+    it('answer invalid_request before the queue: no settings, no attempts, no booking and no request', async () => {
+        const gemini = createGenaiModels({
+            client: clientOptions(),
+            limiterOptions: { maxWaitMs: 100 },
+            models: { embed: { kind: 'embed', model: 'gemini-embedding-001', modelLimits: { rpm: 1 } } },
+        });
+        const { embed } = gemini;
+        const titled = [
+            { text: 'a', title: 'A' },
+            { text: 'b', title: 'B' },
+        ];
+        const invalidCalls: [Promise<unknown>, string][] = [
+            [embed(''), 'Invalid value for option "input.0": a non-empty text'],
+            [embed([]), 'Invalid value for option "input": 1 to 100 texts'],
+            [embed(42 as never), 'Invalid value for option "input": 1 to 100 texts'],
+            [embed('x', null as never), 'Invalid value for option "options"'],
+            [embed('x', [] as never), 'Invalid value for option "options"'],
+            [embed('x', { model: 'm' } as never), 'Option "model" is not supported'],
+            [embed('x', { signal: 'x' } as never), 'Invalid value for option "signal"'],
+            [embed('x', { dimensions: -1 }), 'Invalid value for option "dimensions": a positive integer'],
+            [embed('x', { taskType: 'NOPE' as never }), 'Invalid value for option "taskType"'],
+            [
+                embed([{ text: 'a', title: 'A' }]),
+                'Option "input.title" is not supported: only with taskType RETRIEVAL_DOCUMENT',
+            ],
+            [
+                embed(titled, { taskType: 'RETRIEVAL_DOCUMENT' }),
+                'Invalid value for option "input": gemini-embedding-001 takes one title per call',
+            ],
+        ];
+        for (const [pending, message] of invalidCalls) {
+            expect(await pending).toEqual({ ok: false, error: { code: 'invalid_request', message, retryable: false } });
+        }
+        expect(server.received).toHaveLength(0);
+        expect(await embed('valid')).toMatchObject({ ok: true, data: { attempts: 1 } });
+        expect(server.received).toHaveLength(1);
+    });
+
+    it('answer an aborted signal and Vertex multi-input as unsupported before the queue, aborted first', async () => {
+        const settings = { name: 'embed', model: 'gemini-embedding-2' };
+        const vertex = createGenaiModels({
+            client: vertexOptions(),
+            limiterOptions: { maxWaitMs: 100 },
+            models: { embed: { kind: 'embed', model: 'gemini-embedding-2', modelLimits: { rpm: 1 } } },
+        });
+        expect(await vertex.embed(['a', 'b'])).toEqual({
+            ok: false,
+            error: {
+                code: 'unsupported',
+                message: 'Vertex AI embeds one text per call for gemini-embedding-2; got 2',
+                retryable: false,
+                settings,
+                attempts: 0,
+            },
+        });
+        const controller = new AbortController();
+        controller.abort();
+        expect(await vertex.embed(['a', 'b'], { signal: controller.signal })).toEqual({
+            ok: false,
+            error: { code: 'aborted', message: 'Request aborted', retryable: false, settings, attempts: 0 },
+        });
+        expect(vertexServer.received).toHaveLength(0);
+        // nothing booked: the one request per minute is still free
+        expect(await vertex.embed('a')).toMatchObject({ ok: true, data: { settings, attempts: 1 } });
+        expect(vertexServer.received).toHaveLength(1);
+        const developer = createGenaiModels({
+            client: clientOptions(),
+            models: { embed: { kind: 'embed', model: 'gemini-embedding-2' } },
+        });
+        expect(await developer.embed(['a', 'b'], { signal: controller.signal })).toMatchObject({
+            ok: false,
+            error: { code: 'aborted', settings, attempts: 0 },
+        });
+        expect(server.received).toHaveLength(0);
+    });
+
+    it('apply rpm and intervalMs of modelLimits', async () => {
+        const gemini = createGenaiModels({
+            client: clientOptions(),
+            limiterOptions: { maxWaitMs: 100 },
+            models: {
+                rpm: { kind: 'embed', model: 'm', modelLimits: { rpm: 1 } },
+                interval: { kind: 'embed', model: 'm', modelLimits: { intervalMs: 3000 } },
+            },
+        });
+        for (const embed of [gemini.rpm, gemini.interval]) {
+            expect(await embed('a')).toMatchObject({ ok: true });
+            expect(await embed('b')).toMatchObject({
+                ok: false,
+                error: { code: 'limiter', limiterCode: 'MAX_WAIT_EXCEEDED', settings: { model: 'm' }, attempts: 0 },
+            });
+        }
+        expect(server.received).toHaveLength(2);
+    });
+
+    it('book text and title characters per charsPerToken against tpm', async () => {
+        const gemini = createGenaiModels({
+            client: clientOptions(),
+            models: {
+                exact: { kind: 'embed', model: 'm', modelLimits: { tpm: 2 } },
+                texts: { kind: 'embed', model: 'm', modelLimits: { tpm: 2 } },
+                titles: { kind: 'embed', model: 'm', modelLimits: { tpm: 2 } },
+                coarse: { kind: 'embed', model: 'm', modelLimits: { tpm: 2 }, charsPerToken: 8 },
+            },
+        });
+        const exceeded = { ok: false, error: { limiterCode: 'COST_EXCEEDS_LIMIT', settings: { name: 'texts' } } };
+        expect(await gemini.exact('abcdefgh')).toMatchObject({ ok: true });
+        expect(await gemini.texts(['abcd', 'abcde'])).toMatchObject(exceeded);
+        expect(
+            await gemini.titles([{ text: 'abcd', title: 'abcde' }], { taskType: 'RETRIEVAL_DOCUMENT' }),
+        ).toMatchObject({
+            ok: false,
+            error: { limiterCode: 'COST_EXCEEDS_LIMIT' },
+        });
+        expect(await gemini.coarse(['abcdefgh', 'abcdefgh'])).toMatchObject({ ok: true });
+        expect(server.received).toHaveLength(2);
+    });
+
+    it('apply concurrency of modelLimits and end a waiting aborted call without a request', async () => {
+        const fake = embedServer(30);
+        const gemini = createGenaiModels({
+            client: clientOptions(),
+            models: { embed: { kind: 'embed', model: 'm', modelLimits: { concurrency: 1 } } },
+        });
+        const controller = new AbortController();
+        const calls = [gemini.embed('a'), gemini.embed('b'), gemini.embed('c', { signal: controller.signal })];
+        controller.abort();
+        const [first, second, aborted] = await Promise.all(calls);
+        expect([first?.ok, second?.ok]).toEqual([true, true]);
+        expect(aborted).toMatchObject({
+            ok: false,
+            error: { code: 'aborted', settings: { name: 'embed' }, attempts: 0 },
+        });
+        expect(fake.texts).toEqual(['a', 'b']);
+        expect(fake.runningAtStart).toEqual([0, 0]);
+    });
+
+    it('retry 429, 5xx and retryable errors with the attempts counted; fail a 400 at once', async () => {
+        const gemini = createGenaiModels({
+            client: clientOptions(),
+            limiterOptions: { retryDelayMs: 10 },
+            models: { embed: { kind: 'embed', model: 'm' } },
+        });
+        for (const error of [apiError(429, '0.01s'), apiError(503), apiError(408)]) {
+            server.received.length = 0;
+            embedServer(0, [error]);
+            expect(await gemini.embed('a')).toMatchObject({
+                ok: true,
+                data: { embeddings: [[1]], settings: { name: 'embed', model: 'm' }, attempts: 2 },
+            });
+            expect(server.received).toHaveLength(2);
+        }
+        server.received.length = 0;
+        embedServer(0, [apiError(400)]);
+        expect(await gemini.embed('a')).toMatchObject({
+            ok: false,
+            error: { code: 'http', status: 400, settings: { name: 'embed', model: 'm' }, attempts: 1 },
+        });
+        expect(server.received).toHaveLength(1);
+    });
+
+    it('retry a network error after the global backoff', async () => {
+        // closes the first connection at once (fast, unlike a refused port on Windows), then answers
+        let connections = 0;
+        const body = JSON.stringify({ embeddings: [{ values: [1] }] });
+        const flaky = Bun.listen({
+            hostname: '127.0.0.1',
+            port: 0,
+            socket: {
+                open(socket) {
+                    connections++;
+                    if (connections === 1) {
+                        socket.end();
+                    }
+                },
+                data(socket) {
+                    const head = `HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${body.length}`;
+                    socket.end(`${head}\r\nConnection: close\r\n\r\n${body}`);
+                },
+            },
+        });
+        const gemini = createGenaiModels({
+            client: clientOptions({ baseUrl: `http://127.0.0.1:${flaky.port}` }),
+            limiterOptions: { retryDelayMs: 10 },
+            models: { embed: { kind: 'embed', model: 'm' } },
+        });
+        try {
+            expect(await gemini.embed('a')).toMatchObject({
+                ok: true,
+                data: { embeddings: [[1]], settings: { name: 'embed', model: 'm' }, attempts: 2 },
+            });
+            expect(connections).toBe(2);
+        } finally {
+            flaky.stop(true);
+        }
+    });
+
+    it('give back the token booking of a 429, so its retry fits the same tpm', async () => {
+        embedServer(0, [apiError(429, '0.05s')]);
+        const gemini = createGenaiModels({
+            client: clientOptions(),
+            limiterOptions: { maxWaitMs: 1000 },
+            models: { embed: { kind: 'embed', model: 'm', modelLimits: { tpm: 3 } } },
+        });
+        // books 2 tokens per attempt: a second booking fits the minute only if the first went back
+        expect(await gemini.embed('abcdefgh')).toMatchObject({ ok: true, data: { attempts: 2 } });
+    });
+
+    it('count each input text as one request against rpm', async () => {
+        const gemini = createGenaiModels({
+            client: clientOptions(),
+            limiterOptions: { maxWaitMs: 100 },
+            models: {
+                full: { kind: 'embed', model: 'm', modelLimits: { rpm: 3 } },
+                fits: { kind: 'embed', model: 'm', modelLimits: { rpm: 3 } },
+            },
+        });
+        expect(await gemini.full(['a', 'b'])).toMatchObject({ ok: true });
+        expect(await gemini.full(['c', 'd'])).toMatchObject({
+            ok: false,
+            error: { code: 'limiter', limiterCode: 'MAX_WAIT_EXCEEDED', attempts: 0 },
+        });
+        expect(await gemini.fits(['a', 'b'])).toMatchObject({ ok: true });
+        expect(await gemini.fits('c')).toMatchObject({ ok: true });
+        expect(server.received).toHaveLength(3);
+    });
+
+    it('answer more input texts than rps, rpm or rpd allow as COST_EXCEEDS_LIMIT without a request', async () => {
+        const gemini = createGenaiModels({
+            client: clientOptions(),
+            models: {
+                rps: { kind: 'embed', model: 'm', modelLimits: { rps: 1 } },
+                rpm: { kind: 'embed', model: 'm', modelLimits: { rpm: 2 } },
+                rpd: { kind: 'embed', model: 'm', modelLimits: { rpd: 2 } },
+            },
+        });
+        for (const [name, embed] of [
+            ['rps', gemini.rps],
+            ['rpm', gemini.rpm],
+            ['rpd', gemini.rpd],
+        ] as const) {
+            expect(await embed(['a', 'b', 'c'])).toEqual({
+                ok: false,
+                error: {
+                    code: 'limiter',
+                    message: expect.any(String),
+                    retryable: false,
+                    limiterCode: 'COST_EXCEEDS_LIMIT',
+                    settings: { name, model: 'm' },
+                    attempts: 0,
+                },
+            });
+        }
+        expect(server.received).toHaveLength(0);
+    });
+
+    it('book requests per input text in custom buckets', async () => {
+        const booked: Cost[] = [];
+        const bucket: Bucket = {
+            getWaitMs: () => 0,
+            reserve: (cost) => {
+                booked.push(cost);
+            },
+            settle: () => undefined,
+        };
+        const gemini = createGenaiModels({
+            client: clientOptions(),
+            models: { embed: { kind: 'embed', model: 'm', modelLimits: { buckets: [bucket] } } },
+        });
+        expect(await gemini.embed(['a', 'b', 'c'])).toMatchObject({ ok: true });
+        expect(await gemini.embed('d')).toMatchObject({ ok: true });
+        expect(booked.map((cost) => cost.requests)).toEqual([3, 1]);
+    });
+
+    it('keep intervalMs per call: a multi-input call runs, the next call waits', async () => {
+        const spaced = createGenaiModels({
+            client: clientOptions(),
+            limiterOptions: { maxWaitMs: 100 },
+            models: { embed: { kind: 'embed', model: 'm', modelLimits: { intervalMs: 3000 } } },
+        });
+        expect(await spaced.embed(['a', 'b', 'c'])).toMatchObject({ ok: true, data: { attempts: 1 } });
+        expect(await spaced.embed(['d', 'e'])).toMatchObject({
+            ok: false,
+            error: { code: 'limiter', limiterCode: 'MAX_WAIT_EXCEEDED', attempts: 0 },
+        });
+        const fake = embedServer();
+        const short = createGenaiModels({
+            client: clientOptions(),
+            models: { embed: { kind: 'embed', model: 'm', modelLimits: { intervalMs: 60 } } },
+        });
+        const started = performance.now();
+        const results = await Promise.all([short.embed(['a', 'b']), short.embed(['c', 'd'])]);
+        expect(results.every((result) => result.ok)).toBe(true);
+        expect(fake.texts).toEqual(['a,b', 'c,d']);
+        expect(performance.now() - started).toBeGreaterThanOrEqual(50);
+    });
+
+    it('count embed input texts against an rpm shared with generation models', async () => {
+        const gemini = createGenaiModels({
+            client: clientOptions(),
+            sharedLimits: { rpm: 3 },
+            limiterOptions: { maxWaitMs: 100 },
+            models: { flash: 'gemini-3-flash', embed: { kind: 'embed', model: 'm' } },
+        });
+        expect(await gemini.embed(['a', 'b'])).toMatchObject({ ok: true });
+        expect(await gemini.flash('c')).toMatchObject({ ok: true });
+        expect(await gemini.flash('d')).toMatchObject({ ok: false, error: { limiterCode: 'MAX_WAIT_EXCEEDED' } });
+        expect(server.received).toHaveLength(2);
+    });
+
+    it('keep sharedLimits.concurrency per call: concurrency 1 runs a multi-input call', async () => {
+        const fake = embedServer(30);
+        const gemini = createGenaiModels({
+            client: clientOptions(),
+            sharedLimits: { concurrency: 1 },
+            models: { flash: 'gemini-3-flash', embed: { kind: 'embed', model: 'm' } },
+        });
+        const results = await Promise.all([gemini.embed(['a', 'b', 'c']), gemini.embed(['d', 'e'])]);
+        expect(results.every((result) => result.ok)).toBe(true);
+        expect(fake.texts).toEqual(['a,b,c', 'd,e']);
+        expect(fake.runningAtStart).toEqual([0, 0]);
+    });
+
+    it('share sharedLimits with generation models', async () => {
+        const rpm = createGenaiModels({
+            client: clientOptions(),
+            sharedLimits: { rpm: 1 },
+            limiterOptions: { maxWaitMs: 100 },
+            models: { flash: 'gemini-3-flash', embed: { kind: 'embed', model: 'm' } },
+        });
+        expect(await rpm.flash('a')).toMatchObject({ ok: true });
+        expect(await rpm.embed('b')).toMatchObject({ ok: false, error: { limiterCode: 'MAX_WAIT_EXCEEDED' } });
+        server.received.length = 0;
+        let running = 0;
+        const runningAtStart: number[] = [];
+        server.reply(async (request) => {
+            runningAtStart.push(running);
+            running++;
+            await Bun.sleep(30);
+            running--;
+            return embedReply(request);
+        });
+        const concurrency = createGenaiModels({
+            client: clientOptions(),
+            sharedLimits: { concurrency: 1 },
+            models: { flash: 'gemini-3-flash', embed: { kind: 'embed', model: 'm' } },
+        });
+        const results = await Promise.all([concurrency.flash('a'), concurrency.embed('b'), concurrency.flash('c')]);
+        expect(results.every((result) => result.ok)).toBe(true);
+        expect(runningAtStart).toEqual([0, 0, 0]);
+    });
+});
+
+describe('decision models', () => {
+    /** Yes/no question used where the question kind does not matter. */
+    const NOUL = { type: 'noul', instructions: 'Is it damaged?' } as const;
+
+    beforeEach(() => {
+        vertexServer.received.length = 0;
+        server.reply(decisionsReply());
+    });
+
+    /** Vertex AI client options for fake Vertex server. */
+    function vertexOptions(): GenaiClientOptions {
+        return { vertex: { project: 'p', authClient: fakeAuthClient() }, baseUrl: vertexServer.baseUrl, env: {} };
+    }
+
+    /** Configures fake server delaying calls by callMs, recording running calls; errors answer first. */
+    function decideServer(callMs = 0, errors: Response[] = []) {
+        const runningAtStart: number[] = [];
+        let running = 0;
+        const reply = decisionsReply();
+        server.reply(async (request) => {
+            runningAtStart.push(running);
+            running++;
+            await Bun.sleep(callMs);
+            running--;
+            return errors.shift() ?? reply(request);
+        });
+        return { runningAtStart };
+    }
+
+    /** Configures fake server answering decisions with fixed input token usage. */
+    function usageServer(inputTokens: number): void {
+        server.reply(() =>
+            Response.json({
+                answers: { a: { type: 'noul', noul: 0.8, confidence: 0.8 } },
+                usage: { total_input_tokens: inputTokens, total_output_tokens: 0 },
+            }),
+        );
+    }
+
+    it('throw for invalid decision specs at creation', () => {
+        const client = clientOptions();
+        const invalid: [unknown, RegExp][] = [
+            [{ kind: 'decide', defaults: {} }, /^Option "models\.d\.defaults" is not supported$/],
+            [{ kind: 'decide', modelLimit: {} }, /^Option "models\.d\.modelLimit" is not supported$/],
+            [{ kind: 'decide', model: '' }, /^Invalid value for option "models\.d\.model"$/],
+            [{ kind: 'decide', model: '  ' }, /^Invalid value for option "models\.d\.model"$/],
+            [{ kind: 'decide', model: 1 }, /^Invalid value for option "models\.d\.model"$/],
+            [{ kind: 'decide', charsPerToken: 0 }, /^Invalid value for option "models\.d\.charsPerToken"$/],
+            [{ kind: 'decide', modelLimits: { rpm: 0 } }, /^Invalid value for option "models\.d\.modelLimits\.rpm"$/],
+        ];
+        for (const [spec, message] of invalid) {
+            function create() {
+                return createGenaiModels({ client, models: { d: spec } } as never);
+            }
+            expect(create).toThrow(message);
+            expect(create).toThrow(TypeError);
+        }
+    });
+
+    it('decide with the default or own model id and return the answers; generation defaults not applied', async () => {
+        const gemini = createGenaiModels({
+            client: clientOptions(),
+            defaults: { temperature: 0.5, stop: ['END'] },
+            models: {
+                decide: { kind: 'decide' },
+                own: { kind: 'decide', model: 'models/gemini-decision-1' },
+            },
+        });
+        expect(gemini.decide.id).toBe('gemini-decision-1');
+        expect(gemini.own.id).toBe('models/gemini-decision-1');
+        const questions = {
+            damaged: NOUL,
+            intent: { type: 'choice', instructions: 'Intent?', criteria: { refund: '', exchange: '' } },
+        } as const;
+        expect(await gemini.decide({ input: 'The mug arrived cracked.', questions })).toEqual({
+            ok: true,
+            data: {
+                answers: {
+                    damaged: { type: 'noul', noul: 0.8, confidence: 0.8 },
+                    intent: {
+                        type: 'choice',
+                        choice: 'refund',
+                        probabilities: { refund: 0.7, exchange: 0.3 },
+                        confidence: 0.7,
+                    },
+                },
+                usage: { inputTokens: 6, outputTokens: 0 },
+                model: 'gemini-decision-1',
+                ms: expect.any(Number),
+                settings: { name: 'decide', model: 'gemini-decision-1' },
+                attempts: 1,
+            },
+        });
+        expect(server.received[0]?.path).toBe('/v1beta/decisions');
+        // own fields only: no generation defaults of the instance
+        expect(server.received[0]?.body).toEqual({
+            model: 'gemini-decision-1',
+            input: 'The mug arrived cracked.',
+            questions,
+        });
+        expect(await gemini.own({ input: 'x', questions: { a: NOUL } })).toMatchObject({
+            ok: true,
+            data: { model: 'models/gemini-decision-1', settings: { name: 'own', model: 'models/gemini-decision-1' } },
+        });
+        expect(server.received[1]?.body).toMatchObject({ model: 'models/gemini-decision-1' });
+    });
+
+    it('have an id, no batch, and work without this', async () => {
+        const gemini = createGenaiModels({ client: clientOptions(), models: { decide: { kind: 'decide' } } });
+        expect(Object.keys(gemini.decide)).toEqual(['id']);
+        expect('batch' in gemini.decide).toBe(false);
+        const { decide } = gemini;
+        expect(await decide({ input: 'x', questions: { a: NOUL } })).toMatchObject({ ok: true });
+        expect(await decide.call(undefined, { input: 'y', questions: { a: NOUL } })).toMatchObject({ ok: true });
+    });
+
+    it('answer invalid_request before the queue: no settings, no attempts, no booking and no request', async () => {
+        const gemini = createGenaiModels({
+            client: clientOptions(),
+            limiterOptions: { maxWaitMs: 100 },
+            models: { decide: { kind: 'decide', modelLimits: { rpm: 1 } } },
+        });
+        const { decide } = gemini;
+        const valid = { input: 'x', questions: { a: NOUL } };
+        const invalidCalls: [Promise<unknown>, string][] = [
+            [decide(null as never), 'Invalid value for option "request"'],
+            [decide('x' as never), 'Invalid value for option "request"'],
+            [decide([] as never), 'Invalid value for option "request"'],
+            [
+                decide({ ...valid, model: 'gemini-decision-1' } as never),
+                'Option "model" is not supported: the model of a name is fixed',
+            ],
+            [decide({ ...valid, extra: 1 } as never), 'Option "request.extra" is not supported'],
+            [
+                decide({ input: 'x', questions: { a: { type: 'rank', instructions: 'i' } } } as never),
+                'Invalid value for option "questions.a.type": noul, choice or score',
+            ],
+            [
+                decide({ input: ' ', questions: { a: NOUL } }),
+                'Invalid value for option "input": a non-empty text or 1 or more parts',
+            ],
+            [decide(valid, null as never), 'Invalid value for option "options"'],
+            [decide(valid, [] as never), 'Invalid value for option "options"'],
+            [decide(valid, { config: {} } as never), 'Option "config" is not supported'],
+            [decide(valid, { signal: 'x' } as never), 'Invalid value for option "signal"'],
+        ];
+        for (const [pending, message] of invalidCalls) {
+            expect(await pending).toEqual({ ok: false, error: { code: 'invalid_request', message, retryable: false } });
+        }
+        expect(server.received).toHaveLength(0);
+        // nothing booked: the one request per minute is still free
+        expect(await decide(valid)).toMatchObject({ ok: true, data: { attempts: 1 } });
+        expect(server.received).toHaveLength(1);
+    });
+
+    it('answer Vertex as unsupported and an aborted signal as aborted before the queue, aborted first', async () => {
+        const settings = { name: 'decide', model: 'gemini-decision-1' };
+        const vertex = createGenaiModels({ client: vertexOptions(), models: { decide: { kind: 'decide' } } });
+        const valid = { input: 'x', questions: { a: NOUL } };
+        expect(await vertex.decide(valid)).toEqual({
+            ok: false,
+            error: {
+                code: 'unsupported',
+                message: 'Decisions API is not supported on Vertex AI: Gemini Developer API only',
+                retryable: false,
+                settings,
+                attempts: 0,
+            },
+        });
+        const controller = new AbortController();
+        controller.abort();
+        expect(await vertex.decide(valid, { signal: controller.signal })).toEqual({
+            ok: false,
+            error: { code: 'aborted', message: 'Request aborted', retryable: false, settings, attempts: 0 },
+        });
+        expect(await vertex.decide({ input: 'x', questions: {} })).toMatchObject({
+            ok: false,
+            error: { code: 'invalid_request' },
+        });
+        expect(vertexServer.received).toHaveLength(0);
+        const developer = createGenaiModels({
+            client: clientOptions(),
+            limiterOptions: { maxWaitMs: 100 },
+            models: { decide: { kind: 'decide', modelLimits: { rpm: 1 } } },
+        });
+        expect(await developer.decide(valid, { signal: controller.signal })).toEqual({
+            ok: false,
+            error: { code: 'aborted', message: 'Request aborted', retryable: false, settings, attempts: 0 },
+        });
+        expect(await developer.decide(valid)).toMatchObject({ ok: true, data: { settings, attempts: 1 } });
+        expect(server.received).toHaveLength(1);
+    });
+
+    it('apply rpm and concurrency of modelLimits', async () => {
+        const gemini = createGenaiModels({
+            client: clientOptions(),
+            limiterOptions: { maxWaitMs: 100 },
+            models: { rpm: { kind: 'decide', modelLimits: { rpm: 1 } } },
+        });
+        const valid = { input: 'x', questions: { a: NOUL } };
+        expect(await gemini.rpm(valid)).toMatchObject({ ok: true });
+        expect(await gemini.rpm(valid)).toMatchObject({
+            ok: false,
+            error: {
+                code: 'limiter',
+                limiterCode: 'MAX_WAIT_EXCEEDED',
+                settings: { name: 'rpm', model: 'gemini-decision-1' },
+                attempts: 0,
+            },
+        });
+        expect(server.received).toHaveLength(1);
+        const fake = decideServer(30);
+        const single = createGenaiModels({
+            client: clientOptions(),
+            models: { decide: { kind: 'decide', modelLimits: { concurrency: 1 } } },
+        });
+        const results = await Promise.all([single.decide(valid), single.decide(valid), single.decide(valid)]);
+        expect(results.every((result) => result.ok)).toBe(true);
+        expect(fake.runningAtStart).toEqual([0, 0, 0]);
+    });
+
+    it('book input, instructions and criteria characters per charsPerToken and images against tpm', async () => {
+        const model = { kind: 'decide', modelLimits: { tpm: 3 } } as const;
+        const gemini = createGenaiModels({
+            client: clientOptions(),
+            models: {
+                noul: model,
+                noulOver: model,
+                choice: model,
+                choiceOver: model,
+                score: model,
+                scoreOver: model,
+                coarse: { ...model, charsPerToken: 8 },
+                image: { kind: 'decide', modelLimits: { tpm: 1121 } },
+                imageOver: { kind: 'decide', modelLimits: { tpm: 1121 } },
+            },
+        });
+        const exceeded = { ok: false, error: { code: 'limiter', limiterCode: 'COST_EXCEEDS_LIMIT' } };
+        /** Noul request of 12 characters, or 13 with `over`. */
+        function noul(over: boolean) {
+            const criteria = { true_description: 'abc', false_description: over ? 'ab' : 'a' };
+            return { input: 'abcd', questions: { q: { type: 'noul', instructions: 'abcd', criteria } } } as const;
+        }
+        // 12 characters: 3 tokens; 13: 4 tokens
+        expect(await gemini.noul(noul(false))).toMatchObject({ ok: true });
+        expect(await gemini.noulOver(noul(true))).toMatchObject(exceeded);
+        expect(await gemini.coarse(noul(true))).toMatchObject({ ok: true });
+        const choiceInstructions = [{ type: 'text', text: 'ab' }] as const;
+        expect(
+            await gemini.choice({
+                input: 'abcd',
+                questions: { q: { type: 'choice', instructions: choiceInstructions, criteria: { ab: '', cd: 'ab' } } },
+            }),
+        ).toMatchObject({ ok: true });
+        expect(
+            await gemini.choiceOver({
+                input: 'abcd',
+                questions: { q: { type: 'choice', instructions: choiceInstructions, criteria: { abc: '', cd: 'ab' } } },
+            }),
+        ).toMatchObject(exceeded);
+        const scoreInstructions = { type: 'text', text: 'abcd' } as const;
+        expect(
+            await gemini.score({
+                input: [{ type: 'text', text: 'abcd' }],
+                questions: { q: { type: 'score', instructions: scoreInstructions, criteria: ['ab', 'cd'] } },
+            }),
+        ).toMatchObject({ ok: true });
+        expect(
+            await gemini.scoreOver({
+                input: [{ type: 'text', text: 'abcd' }],
+                questions: { q: { type: 'score', instructions: scoreInstructions, criteria: ['abc', 'cd'] } },
+            }),
+        ).toMatchObject(exceeded);
+        // 1120 per image plus 4 or 5 characters
+        const image = { type: 'image_url', image_url: { url: 'data:image/png;base64,AA==' } } as const;
+        expect(
+            await gemini.image({
+                input: [{ type: 'text', text: 'ab' }, image],
+                questions: { q: { ...NOUL, instructions: 'ab' } },
+            }),
+        ).toMatchObject({ ok: true });
+        expect(
+            await gemini.imageOver({
+                input: [{ type: 'text', text: 'abc' }, image],
+                questions: { q: { ...NOUL, instructions: 'ab' } },
+            }),
+        ).toMatchObject(exceeded);
+        expect(server.received).toHaveLength(5);
+    });
+
+    it('settle the token booking against total_input_tokens of the response', async () => {
+        // books 6 tokens (24 characters) per call against tpm 10
+        const request = {
+            input: 'abcdefghijkl',
+            questions: { a: { type: 'noul', instructions: 'abcdefghijkl' } },
+        } as const;
+        const options = { client: clientOptions(), limiterOptions: { maxWaitMs: 100 } };
+        usageServer(1);
+        const low = createGenaiModels({ ...options, models: { decide: { kind: 'decide', modelLimits: { tpm: 10 } } } });
+        expect(await low.decide(request)).toMatchObject({ ok: true, data: { usage: { inputTokens: 1 } } });
+        // settled to 1: the next booking of 6 fits
+        expect(await low.decide(request)).toMatchObject({ ok: true });
+        usageServer(5);
+        const high = createGenaiModels({
+            ...options,
+            models: { decide: { kind: 'decide', modelLimits: { tpm: 10 } } },
+        });
+        expect(await high.decide(request)).toMatchObject({ ok: true, data: { usage: { inputTokens: 5 } } });
+        // settled to 5: the next booking of 6 exceeds the minute
+        expect(await high.decide(request)).toMatchObject({
+            ok: false,
+            error: { code: 'limiter', limiterCode: 'MAX_WAIT_EXCEEDED' },
+        });
+        expect(server.received).toHaveLength(3);
+    });
+
+    it('keep the estimated token booking when the response has no usage counts', async () => {
+        // books 6 tokens (24 characters) per call against tpm 10
+        const request = {
+            input: 'abcdefghijkl',
+            questions: { a: { type: 'noul', instructions: 'abcdefghijkl' } },
+        } as const;
+        server.reply(() => Response.json({ answers: { a: { type: 'noul', noul: 0.8, confidence: 0.8 } } }));
+        const gemini = createGenaiModels({
+            client: clientOptions(),
+            limiterOptions: { maxWaitMs: 100 },
+            models: { decide: { kind: 'decide', modelLimits: { tpm: 10 } } },
+        });
+        expect(await gemini.decide(request)).toMatchObject({
+            ok: true,
+            data: { usage: { inputTokens: null, outputTokens: null }, attempts: 1 },
+        });
+        // estimate of 6 kept: the next booking of 6 exceeds the minute
+        expect(await gemini.decide(request)).toMatchObject({
+            ok: false,
+            error: { code: 'limiter', limiterCode: 'MAX_WAIT_EXCEEDED' },
+        });
+        expect(server.received).toHaveLength(1);
+    });
+
+    it('end a waiting aborted call without a request', async () => {
+        const fake = decideServer(30);
+        const gemini = createGenaiModels({
+            client: clientOptions(),
+            models: { decide: { kind: 'decide', modelLimits: { concurrency: 1 } } },
+        });
+        const valid = { input: 'x', questions: { a: NOUL } };
+        const controller = new AbortController();
+        const calls = [gemini.decide(valid), gemini.decide(valid), gemini.decide(valid, { signal: controller.signal })];
+        controller.abort();
+        const [first, second, aborted] = await Promise.all(calls);
+        expect([first?.ok, second?.ok]).toEqual([true, true]);
+        expect(aborted).toMatchObject({
+            ok: false,
+            error: { code: 'aborted', settings: { name: 'decide', model: 'gemini-decision-1' }, attempts: 0 },
+        });
+        expect(server.received).toHaveLength(2);
+        expect(fake.runningAtStart).toEqual([0, 0]);
+    });
+
+    it('retry 429, 5xx and retryable errors with the attempts counted; fail a 400 at once', async () => {
+        const gemini = createGenaiModels({
+            client: clientOptions(),
+            limiterOptions: { retryDelayMs: 10 },
+            models: { decide: { kind: 'decide' } },
+        });
+        const settings = { name: 'decide', model: 'gemini-decision-1' };
+        const valid = { input: 'x', questions: { a: NOUL } };
+        for (const error of [apiError(429, '0.01s'), apiError(503), apiError(408)]) {
+            server.received.length = 0;
+            decideServer(0, [error]);
+            expect(await gemini.decide(valid)).toMatchObject({
+                ok: true,
+                data: { answers: { a: { type: 'noul' } }, settings, attempts: 2 },
+            });
+            expect(server.received).toHaveLength(2);
+        }
+        server.received.length = 0;
+        decideServer(0, [decisionError(400, 'invalid_request', 'Bad.')]);
+        expect(await gemini.decide(valid)).toMatchObject({
+            ok: false,
+            error: { code: 'http', status: 400, settings, attempts: 1 },
+        });
+        expect(server.received).toHaveLength(1);
+    });
+
+    it('give back the token booking of a 429, so its retry fits the same tpm', async () => {
+        decideServer(0, [apiError(429, '0.05s')]);
+        const gemini = createGenaiModels({
+            client: clientOptions(),
+            limiterOptions: { maxWaitMs: 1000 },
+            models: { decide: { kind: 'decide', modelLimits: { tpm: 3 } } },
+        });
+        // books 2 tokens per attempt: a second booking fits the minute only if the first went back
+        expect(
+            await gemini.decide({ input: 'abcd', questions: { a: { type: 'noul', instructions: 'abcd' } } }),
+        ).toMatchObject({
+            ok: true,
+            data: { attempts: 2 },
+        });
+    });
+});
+
+describe('named models of mixed kinds', () => {
+    /** Answers decisions, embeddings (one vector per input) and generation calls by path. */
+    function mixedReply(): GeminiReply {
+        const decisions = decisionsReply();
+        return (request) => {
+            if (request.path.endsWith(':batchEmbedContents')) {
+                const requests = (request.body?.requests ?? []) as unknown[];
+                return Response.json({ embeddings: requests.map(() => ({ values: [1] })) });
+            }
+            return request.path === '/v1beta/decisions' ? decisions(request) : generateResponse('ok');
+        };
+    }
+
+    const models = {
+        flash: 'gemini-3-flash',
+        embed: { kind: 'embed', model: 'm' },
+        decide: { kind: 'decide' },
+    } as const;
+    const question = { input: 'x', questions: { a: { type: 'noul', instructions: 'i' } } } as const;
+
+    it('share sharedLimits across generation, embedding and decision models', async () => {
+        server.reply(mixedReply());
+        const rpm = createGenaiModels({
+            client: clientOptions(),
+            sharedLimits: { rpm: 2 },
+            limiterOptions: { maxWaitMs: 100 },
+            models,
+        });
+        expect(await rpm.flash('a')).toMatchObject({ ok: true });
+        expect(await rpm.embed('b')).toMatchObject({ ok: true });
+        expect(await rpm.decide(question)).toMatchObject({ ok: false, error: { limiterCode: 'MAX_WAIT_EXCEEDED' } });
+        server.received.length = 0;
+        const reply = mixedReply();
+        let running = 0;
+        const runningAtStart: number[] = [];
+        server.reply(async (request) => {
+            runningAtStart.push(running);
+            running++;
+            await Bun.sleep(30);
+            running--;
+            return reply(request);
+        });
+        const concurrency = createGenaiModels({ client: clientOptions(), sharedLimits: { concurrency: 1 }, models });
+        const results = await Promise.all([
+            concurrency.flash('a'),
+            concurrency.embed('b'),
+            concurrency.decide(question),
+        ]);
+        expect(results.every((result) => result.ok)).toBe(true);
+        expect(runningAtStart).toEqual([0, 0, 0]);
+    });
+
+    it('keep the 429 backoff of one model to its own queue', async () => {
+        const reply = mixedReply();
+        let embedCalls = 0;
+        let firstEmbed: () => void = () => undefined;
+        const embedSeen = new Promise<void>((resolve) => {
+            firstEmbed = resolve;
+        });
+        server.reply((request) => {
+            if (request.path.endsWith(':batchEmbedContents') && embedCalls++ === 0) {
+                firstEmbed();
+                return apiError(429, '0.3s');
+            }
+            return reply(request);
+        });
+        const gemini = createGenaiModels({ client: clientOptions(), sharedLimits: { rpm: 100 }, models });
+        const embedding = gemini.embed('a');
+        await embedSeen;
+        const startedAt = performance.now();
+        expect(await gemini.flash('b')).toMatchObject({ ok: true, data: { attempts: 1 } });
+        expect(await gemini.decide(question)).toMatchObject({ ok: true, data: { attempts: 1 } });
+        expect(performance.now() - startedAt).toBeLessThan(250);
+        expect(await embedding).toMatchObject({ ok: true, data: { attempts: 2 } });
+        expect(server.received.map((request) => request.path.split('/').pop())).toEqual([
+            'm:batchEmbedContents',
+            'gemini-3-flash:generateContent',
+            'decisions',
+            'm:batchEmbedContents',
+        ]);
     });
 });

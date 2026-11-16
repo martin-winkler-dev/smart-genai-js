@@ -8,6 +8,7 @@ export { MAX_EMBED_INPUTS } from './core/embed.js';
 export { assistantMessage, toolMessage } from './core/messages.js';
 export { mergeGenaiConfig, validateGenaiConfig } from './core/request.js';
 export type {
+    GenaiAnyModelSpec,
     GenaiBatch,
     GenaiBatchCheckOptions,
     GenaiBatchItem,
@@ -28,6 +29,8 @@ export type {
     GenaiDecideInputPart,
     GenaiDecideInstructions,
     GenaiDecideMediaPart,
+    GenaiDecideModel,
+    GenaiDecideModelSpec,
     GenaiDecideNoulAnswer,
     GenaiDecideNoulQuestion,
     GenaiDecideOutput,
@@ -37,7 +40,11 @@ export type {
     GenaiDecideScoreAnswer,
     GenaiDecideScoreQuestion,
     GenaiDefaults,
+    GenaiEmbedDefaults,
     GenaiEmbedInput,
+    GenaiEmbedModel,
+    GenaiEmbedModelOptions,
+    GenaiEmbedModelSpec,
     GenaiEmbedOutput,
     GenaiEmbedRequest,
     GenaiEmbedTask,

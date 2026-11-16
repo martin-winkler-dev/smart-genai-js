@@ -3,7 +3,7 @@
 
 import { afterAll, beforeEach, describe, expect, it } from 'bun:test';
 import { createGenaiClient } from '../../../src/core/client.js';
-import { MAX_EMBED_INPUTS } from '../../../src/core/embed.js';
+import { embedUnsupported, MAX_EMBED_INPUTS } from '../../../src/core/embed.js';
 import type { GenaiClient, GenaiEmbedRequest } from '../../../src/types.js';
 import { apiError, startFakeGemini } from '../fake-gemini.js';
 import { fakeAuthClient, startFakeVertex } from '../fake-vertex.js';
@@ -344,5 +344,28 @@ describe('embed on Vertex AI', () => {
                 },
             });
         }
+    });
+});
+
+describe('embedUnsupported', () => {
+    it('allows any input count on the Developer API', () => {
+        expect(embedUnsupported('developer', 'gemini-embedding-2', 5)).toBeUndefined();
+    });
+
+    it('allows several texts to gemini-embedding-001 on Vertex AI, also with Google publisher prefix', () => {
+        expect(embedUnsupported('vertex', 'gemini-embedding-001', MAX_EMBED_INPUTS)).toBeUndefined();
+        expect(embedUnsupported('vertex', 'publishers/google/models/gemini-embedding-001', 2)).toBeUndefined();
+    });
+
+    it('allows one text and rejects several texts to gemini-embedding-2 on Vertex AI', () => {
+        expect(embedUnsupported('vertex', 'gemini-embedding-2', 1)).toBeUndefined();
+        expect(embedUnsupported('vertex', 'gemini-embedding-2', 2)).toBe(
+            'Vertex AI embeds one text per call for gemini-embedding-2; got 2',
+        );
+    });
+
+    it('rejects several texts to a maas model on Vertex AI', () => {
+        const model = 'publishers/acme/models/embed-maas';
+        expect(embedUnsupported('vertex', model, 2)).toBe(`Vertex AI embeds one text per call for ${model}; got 2`);
     });
 });

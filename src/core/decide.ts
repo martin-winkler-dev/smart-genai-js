@@ -22,7 +22,7 @@ import { checkOptionKeys, InvalidRequestError, MATCH_IMAGE_DATA_URL } from './re
 type ApiBlock = Record<string, unknown>;
 
 /** Request body of `POST /decisions`. */
-type DecideBody = { model: string; input: string | ApiBlock[]; questions: Record<string, GenaiDecideQuestion> };
+export type DecideBody = { model: string; input: string | ApiBlock[]; questions: Record<string, GenaiDecideQuestion> };
 
 // -------------------------------------------------------------------
 // --- 2. Constants
@@ -139,15 +139,11 @@ export function createDecide(rest: InlineBatchRest | undefined): GenaiClient['de
     return decide as GenaiClient['decide'];
 }
 
-// -------------------------------------------------------------------
-// --- 4. Private Functions
-// -------------------------------------------------------------------
-
 /**
  * Validates decision request and builds request body.
  * @throws {InvalidRequestError} If field, input, or question is invalid.
  */
-function toDecideBody(request: GenaiDecideRequest): DecideBody {
+export function toDecideBody(request: GenaiDecideRequest): DecideBody {
     checkOptionKeys(request, REQUEST_KEYS, 'request.');
     const model = request.model ?? DEFAULT_DECIDE_MODEL;
     if (typeof model !== 'string' || model.trim() === '') {
@@ -171,6 +167,10 @@ function toDecideBody(request: GenaiDecideRequest): DecideBody {
     }
     return { model, input: toInput(request.input), questions: { ...questions } };
 }
+
+// -------------------------------------------------------------------
+// --- 4. Private Functions
+// -------------------------------------------------------------------
 
 /**
  * Converts decision input to string or API block list.
